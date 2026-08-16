@@ -1,7 +1,7 @@
 
 # 16/8/2026
 
-![items](Image\1682026-arrived_items.png)
+![items](Image/1682026-arrived_items.png)
 
 
 **Today arrived items** :
@@ -16,7 +16,7 @@
 
 
 
-![items](Image\1682026-connecting_board.png)
+![items](Image/1682026-connecting_board.png)
 
 - Connecting ESP32 and the amply through D-point cables
 - Connecting the female DC jack with TPA3116V2
