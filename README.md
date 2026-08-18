@@ -6,7 +6,7 @@ This project is a DIY guide to building a haptic feedback system for sim racing 
 | Criteria | Eccentric motor (ERM) | Soundcard + bass shaker | This project (ESP32 + exciter) |
 |---|---|---|---|
 | **Cost** | Low | High | Low |
-| **Response speed** | Slow (motor needs time to spin up/down) | Instant | Instant |
+| **Response speed** | Slow (motor needs time to spin up/down) | Instant | Instant (Fastest) |
 | **Vibration range** | Narrow, limited control | Wide, full control over frequency and amplitude | Acceptable, good enough for the target effects |
 | **Safety** | Safe | Risk of damaging the laptop's soundcard or onboard audio circuit | Fully safe (isolated from the PC) |
 
@@ -21,12 +21,12 @@ This project is a DIY guide to building a haptic feedback system for sim racing 
 # System architecture
 ```mermaid
 flowchart LR
-    A["SimHub<br/>PC"] -->|Telemetry data| B["ESP32<br/>Builds signal"]
-    B -->|Control signal| C["Amp - class D<br/>TPA3116D2"]
-    C -->|Audio signal| D["Exciters<br/>Vibration output"]
-    E["Power supply<br/>12V 3A"] -->|Power| C
+    A["Assetto Corsa<br/>get_telemetry (120Hz)"] -->|Serial| B["ESP32<br/>Waveform Synthesizer"]
+    B -->|DAC GPIO 25| C["Amp - Class D<br/>TPA3116D2"]
+    C -->|Audio Signal| D["Sound Exciter<br/>Haptic Pedal"]
+    E["Power Supply<br/>12V 3A"] -->|Power| C
 ```
-- **Signal path**  — SimHub reads game telemetry and exposes them as properties (e.g. ABS state, wheel slip). These values are sent to the ESP32 via serial. The ESP32 parses the incoming data and processes it through a mapping function, synthesizing a waveform (frequency and amplitude) for each effect. This signal is then output to the TPA3116D2 via the ESP32's internal DAC, which drives the sound exciters mounted on the pedal.
+- **Signal path**  — Game physics telemetry is read directly from shared memory at 120 Hz (`get_telemetry()`) and transmitted to the ESP32 over Serial. The ESP32 parses the telemetry, applies the effect mapping logic, and continuously synthesizes analog waveforms through its internal DAC (GPIO 25). The signal is amplified by the TPA3116D2 Class D amplifier to drive the sound exciter mounted on the pedal.
 
 
 # Supported features :
