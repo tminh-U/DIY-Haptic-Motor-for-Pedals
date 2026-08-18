@@ -20,17 +20,11 @@ This project is a DIY guide to building a haptic feedback system for sim racing 
 
 # System architecture
 ```mermaid
-
 flowchart LR
-
-A[SimHub<br/>PC] -->|Telemetry data| B[ESP32<br/>Builds signal]
-
-B -->|Control signal| C[Amp - class D<br/>TPA3116D2]
-
-C -->|Audio signal| D[Exciters<br/>Vibration output]
-
-E[Power supply<br/>12V 3A] -->|Power| C
-
+    A["SimHub<br/>PC"] -->|Telemetry data| B["ESP32<br/>Builds signal"]
+    B -->|Control signal| C["Amp - class D<br/>TPA3116D2"]
+    C -->|Audio signal| D["Exciters<br/>Vibration output"]
+    E["Power supply<br/>12V 3A"] -->|Power| C
 ```
 - **Signal path**  — SimHub reads game telemetry and exposes them as properties (e.g. ABS state, wheel slip). These values are sent to the ESP32 via serial. The ESP32 parses the incoming data and processes it through a mapping function, synthesizing a waveform (frequency and amplitude) for each effect. This signal is then output to the TPA3116D2 via the ESP32's internal DAC, which drives the sound exciters mounted on the pedal.
 
@@ -45,10 +39,10 @@ E[Power supply<br/>12V 3A] -->|Power| C
 
 ```mermaid
 flowchart TD
-    A[Game shared memory<br/>acpmf_physics raw bytes] --> B[get_telemetry&#40;&#41;<br/>Bytes to named variables:<br/>abs, wheelSlip, suspensionTravel]
-    B -->|Serial| C[ESP32<br/>Synthesizes waveform]
-    C -->|DAC output| D[Amp - class D<br/>TPA3116D2]
-    D --> E[Sound exciter<br/>Vibration on pedal]
+    A["Game shared memory<br/>acpmf_physics raw bytes"] --> B["get_telemetry()<br/>Bytes to named variables:<br/>abs, wheelSlip, suspensionTravel"]
+    B -->|Serial| C["ESP32<br/>Synthesizes waveform"]
+    C -->|DAC output| D["Amp - class D<br/>TPA3116D2"]
+    D --> E["Sound exciter<br/>Vibration on pedal"]
 ```
 
 **Pipeline stages:**
