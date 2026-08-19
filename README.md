@@ -1,5 +1,5 @@
 
-This project is a DIY guide to building a haptic feedback system for sim racing pedals, using a custom controller connected to SimHub to simulate **ABS pulse** and **road effect** — especially on the brake pedal. It addresses one of the most significant limitations of load-cell pedals: the lack of ABS and lock-up feedback during trail-braking.
+This project is a DIY guide to building a haptic feedback system for sim racing pedals, using a custom controller to simulate **ABS pulse** and **road effect** — especially on the brake pedal. It addresses one of the most significant limitations of load-cell pedals: the lack of ABS and lock-up feedback during trail-braking.
 
 # Existing solutions & why a custom approach
 
@@ -85,7 +85,7 @@ $$y[n] = y[n-1] + 0.072 \cdot \big(x[n] - y[n-1]\big)$$
 After analyzing various $\alpha$ values, $\alpha = 0.072$ was chosen because it allows the step response to reach $\approx 95\%$ convergence within a single 120 Hz telemetry frame ($8.33\text{ ms}$), smoothly eliminating discrete steps without introducing perceptible latency.
 
 ### How all of the effects are calculated in this module:
-1. **ABS:** In real life, ABS pulse is caused by the hydraulic modulator releasing and reapplying brake pressure rapidly 10–15 times per second (Bosch Automotive Handbook), so the frequency is set to 12 Hz, which is the sweet spot for ABS. Because sound exciters have poor low-frequency response at 12 Hz, I initially used Amplitude Modulation (AM)—modulating a 60 Hz carrier wave with a 12 Hz sine envelope—to maximize tactile feedback strength while preserving the realistic frequency. Since `absVal` is a boolean telemetry flag (0 or 1), driver brake pedal pressure (`brakeVal`) is used to scale the vibration amplitude dynamically:
+1. **ABS:** In real life, ABS pulse is caused by the hydraulic modulator releasing and reapplying brake pressure rapidly 10–15 times per second (Bosch Automotive Handbook), so the frequency is set to 12 Hz, which is the sweet spot for ABS. Because sound exciters have poor low-frequency response at 12 Hz, Amplitude Modulation (AM) is used - modulating a 60 Hz carrier wave with a 12 Hz sine envelope to maximize tactile feedback strength while preserving the realistic frequency. Since `absVal` is a boolean telemetry flag (0 or 1), driver brake pedal pressure (`brakeVal`) is used to scale the vibration amplitude dynamically:
 
 $$y_{\text{carrier}}(t) = \sin(2\pi \cdot 60 \cdot t)$$
 $$y_{\text{mod}}(t) = \sin(2\pi \cdot 12 \cdot t)$$
@@ -112,7 +112,7 @@ $$\text{DAC}_{\text{ABS}}(t) = 128 + (120 \cdot \text{brakeVal}) \cdot y_{\text{
 This ~65:35 duty cycle maintains the realistic 12 hydraulic cycles per second of an ABS system while delivering sharp, instantaneous tactile impacts to the pedal.
 
 2. **Road Effect:** 
-When the tires hit a bump or kerb, it imparts an impulse shock to the suspension. In real vehicles, this excites structural chassis and suspension resonances (~80–120 Hz, centered at 100 Hz, per Gillespie, 1992) transmitted through the firewall into the pedal box, with an intensity proportional to the vertical suspension displacement rate ($\Delta \text{Sus}$).
+When the tires hit a bump or kerb or roll over uneven road surfaces, it imparts an impulse shock to the suspension. Based on previous sim racing hardware builders' experience, 75Hz is the chosen frequency with an intensity proportional to the vertical suspension displacement rate ($\Delta \text{Sus}$).
 
 To simulate this tactile feel through the sound exciter, the amplitude is modulated by the frame-to-frame suspension velocity:
 
@@ -122,11 +122,13 @@ $$A_{\text{road}}(t) = \min\left(60, \ \Delta \text{Sus}(t) \cdot \frac{60}{0.06
 
 $$\text{DAC}_{\text{road}}(t) = A_{\text{road}}(t) \cdot \sin(2\pi \cdot 100 \cdot t)$$
 
+**Note :** The frequency run continiously from the start. 
+
 
 3. **Lock-up / Tire Slip:** 
-When the tires exceed the peak friction threshold, kinetic stick-slip friction and in-plane carcass torsional deformation generate continuous low-frequency vibrations (~45 Hz, per Pacejka, 2005). 
+When the tires exceed the peak friction threshold, kinetic stick-slip friction and in-plane carcass torsional deformation generate continuous low-frequency vibrations. 
 
-According to **Pacejka's $\mu\text{–Slip}$ Magic Formula curve** (*Tire and Vehicle Dynamics*), racing tires reach their peak braking friction ($\mu_{\max}$) at approximately $15\%\text{–}20\%$ longitudinal slip ratio ($\text{Slip} = 0.15\text{–}0.20$). Beyond $25\%\text{–}30\%$ slip, the tire exits the elastic grip zone and enters the unstable kinetic sliding region. 
+According to **Pacejka's $\mu\text{–Slip}$ Magic Formula curve** (*Tire and Vehicle Dynamics*), racing tires reach their peak braking friction ($\mu_{\max}$) at approximately $15\%\text{-}20\%$ longitudinal slip ratio ($\text{Slip} = 0.15\text{-}0.20$). Beyond $25\%\text{-}30\%$ slip, the tire exits the elastic grip zone and enters the unstable kinetic sliding region. 
 
 To provide intuitive driver feedback without unnecessary foot fatigue during normal braking, a **threshold deadband of $\text{Slip} = 0.30$** is implemented:
 - **$\text{Slip} < 0.30$ (Optimal Grip Zone):** The pedal remains completely smooth, confirming to the driver that braking is operating within the maximum traction envelope.
@@ -150,6 +152,8 @@ A_{\text{slip}}(t) = \begin{cases}
 \end{cases}
 $$
 
+**Note :** 45Hz is the chosen frequency based on previous sim racing DIY builders' experience.
+
 ### Tire Slip Mapping & Perception Breakdown:
 
 | Slip Value ($\text{Slip}_{\text{front}}$) | Tire Physical State (Pacejka Model) | Amplitude Formula ($A_{\text{slip}}$) | Output Amplitude ($A$) | Tactile Perception / Driver Feedback |
@@ -171,14 +175,21 @@ $$\text{Output}(t) = 128 + \sum_{i} \Big( w_i \cdot y_i(t) \Big)$$
 where $\sum w_i \le 1.0$, ensuring all combined waveforms stay within safe headroom limits while maintaining distinct feedback clarity.
 
 
+Here is the weighted mixing lookup table:
 
-
-
-
-
+| State / Combination | Bitmask `[b2 b1 b0]`<br>*(Slip · Road · ABS)* | $w_{\text{ABS}}$<br>*(Bit 0)* | $w_{\text{Road}}$<br>*(Bit 1)* | $w_{\text{Slip}}$<br>*(Bit 2)* | Total Weight<br>($\sum w_i$) | Tactile Feedback Rationale |
+|---|:---:|:---:|:---:|:---:|:---:|---|
+| **Idle / None** | `0b000` (0) | $0.00$ | $0.00$ | $0.00$ | $0.00$ | Signal stays at DAC quiescent midpoint (128). |
+| **ABS Only** | `0b001` (1) | **$1.00$ (100%)** | $0.00$ | $0.00$ | $1.00$ | Full ABS hydraulic pulsation without attenuation. |
+| **Road Effect Only** | `0b010` (2) | $0.00$ | **$1.00$ (100%)** | $0.00$ | $1.00$ | Full suspension displacement & kerb rumble. |
+| **ABS + Road** | `0b011` (3) | **$0.75$ (75%)** | **$0.25$ (25%)** | $0.00$ | $1.00$ | Dominant ABS pulse with background surface texture. |
+| **Tire Slip Only** | `0b100` (4) | $0.00$ | $0.00$ | **$1.00$ (100%)** | $1.00$ | Full 45 Hz tire scrub and impending lock-up warning. |
+| **ABS + Tire Slip** | `0b101` (5) | **$0.70$ (70%)** | $0.00$ | **$0.30$ (30%)** | $1.00$ | Primary ABS intervention with distinct tire scrub cue. |
+| **Slip + Road** | `0b110` (6) | $0.00$ | **$0.45$ (45%)** | **$0.55$ (55%)** | $1.00$ | Balanced chassis road impact and progressive tire scrub. |
+| **All 3 Active** | `0b111` (7) | **$0.65$ (65%)** | **$0.15$ (15%)** | **$0.20$ (20%)** | $1.00$ | Critical ABS feedback dominates; road & slip remain distinct. |
 
 # Hardware implementation
-- ESP32 DevKit V1 — microcontroller that receives telemetry from SimHub and generates the control waveform
+- ESP32 DevKit V1 — microcontroller that receives telemetry from the PC through get_telemetry() and generates the control waveform
 - TPA3116D2 — class D amplifier, drives the sound exciters
 - Sound exciter — 4Ω 25W, resonance frequency ~60Hz — converts the amplified signal into physical vibration (see spec/frequency response note below)
 - DC 12V 3A power supply — powers the amplifier
@@ -201,14 +212,5 @@ where $\sum w_i \le 1.0$, ensuring all combined waveforms stay within safe headr
 
 # Academic & Technical References
 
-1. **Road Harshness & Structural Transmission (80–120 Hz):**
-   - **Gillespie, Thomas D. (1992).** *Fundamentals of Vehicle Dynamics*. Society of Automotive Engineers (SAE International). Chapter 10: "Road Roughness & Ride NVH" (details the 80–120 Hz structural vibration transmission from suspension to the firewall and pedal box).
-   - **Milliken, William F., & Milliken, Douglas L. (1995).** *Race Car Vehicle Dynamics*. SAE International. Chapter 17: "Ride and Handling NVH".
-
-2. **Tire Stick-Slip, Friction Limits & Carcass Dynamics (30–50 Hz):**
-   - **Pacejka, Hans B. (2005).** *Tire and Vehicle Dynamics* (2nd Edition). Butterworth-Heinemann / Elsevier. Chapter 1: "Tire Characteristics and Representations" (details the $\mu\text{–Slip}$ curve, peak braking friction threshold at 15–20% slip, unstable kinetic sliding zone $>30\%$, and in-plane carcass torsional modes).
-   - **SAE Technical Paper 2008-01-0818:** *"In-Plane Tire Dynamics and Vibration Modes under Braking Torque"*.
-
-3. **ABS Hydraulic Cycling Benchmark (10–15 Hz):**
+1. **ABS Hydraulic Cycling Benchmark (10–15 Hz):**
    - **Bosch Automotive Handbook (10th Edition).** Robert Bosch GmbH. "Antilock Braking Systems (ABS) - Hydraulic Valve Modulation and Pressure Cycling".
-   - **Industry Benchmarks:** SimHub ShakeIt standard tactile profiles and Simucube ActivePedal telemetry frequency mapping.
