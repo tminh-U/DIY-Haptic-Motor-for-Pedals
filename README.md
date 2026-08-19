@@ -62,11 +62,29 @@ flowchart TD
 To prevent harsh, stepped vibrations caused by frame-to-frame telemetry updates, raw telemetry values are smoothed before generating waveforms:
 
 - **LERP (Linear Interpolation):** Requires a strictly fixed arrival interval between data packets. Because Windows is not a real-time OS, packets can arrive with slight timing delays (e.g., 12 ms instead of 8.33 ms). This causes fixed-step LERP to finish too early or freeze, creating noticeable stutter.
-- **EMA (Exponential Moving Average):** Calculates new values recursively using only the current reading and the previous smoothed state ($y[n] = y[n-1] + \alpha \cdot (x[n] - y[n-1])$). It runs independently of packet arrival timing, eliminating jitter. Furthermore, EMA creates a more natural feel because physical systems like brake fluid pressure and suspension damping naturally follow exponential decay curves (first-order dynamic response).
+- **EMA (Exponential Moving Average):** Calculates new values recursively using only the current reading and the previous smoothed state. It runs independently of packet arrival timing, eliminating jitter. Furthermore, EMA creates a more natural feel because physical systems like brake fluid pressure and suspension damping naturally follow exponential decay curves (first-order dynamic response).
 
 **Mathematical Formulation:**
 
-$$y[n] = y[n-1] + 0.072 \cdot \big(x[n] - y[n-1]\big)$$
+The discrete first-order Exponential Moving Average (EMA) filter is defined as:
+
+$$y[n] = y[n-1] + \alpha \cdot \big(x[n] - y[n-1]\big)$$
+
+**Implementation in this project (Weighted ABS Intensity):**
+
+$$\text{Target}_{\text{ABS}}[n] = \begin{cases} 
+w_{\text{ABS}} \cdot \text{brakeVal}[n] & \text{if } \text{absVal} = 1 \\
+0 & \text{if } \text{absVal} = 0 
+\end{cases}$$
+
+$$y_{\text{ABS}}[n] = y_{\text{ABS}}[n-1] + 0.072 \cdot \Big(\text{Target}_{\text{ABS}}[n] - y_{\text{ABS}}[n-1]\Big)$$
+
+Where:
+- $y_{\text{ABS}}[n]$ (`curg_brakeVal`): Smoothed ABS modulation amplitude at interrupt step $n$.
+- $y_{\text{ABS}}[n-1]$: Smoothed state from the preceding $200\ \mu\text{s}$ timer interrupt cycle.
+- $\text{Target}_{\text{ABS}}[n]$: Weighted target brake demand, scaled by the dynamic mixing coefficient $w_{\text{ABS}} \in [0.0, 1.0]$.
+- $\alpha = 0.072$: Smoothing factor calibrated for $95\%$ convergence within one 120 Hz telemetry frame.
+
 
 #### Step Response Over 42 Interrupt Cycles ($0 \rightarrow 100\%$ Step):
 
