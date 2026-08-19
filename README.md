@@ -110,7 +110,7 @@ $$y_{\text{mod}}(t) = \sin(2\pi \cdot 12 \cdot t)$$
 
 $$\Rightarrow y(t) = \left( \frac{1 + \sin(2\pi \cdot 12 \cdot t)}{2} \right) \cdot \sin(2\pi \cdot 60 \cdot t)$$
 
-$$\text{DAC}(t) = 128 + (120 \cdot \text{brakeVal}) \cdot y(t)$$
+$$\text{DAC}(t) = 128 + (105 \cdot \text{brakeVal}) \cdot y(t)$$
 
 **Note:** `brakeVal` is the normalized brake pedal pressure ($0.0 \le \text{brakeVal} \le 1.0$) from telemetry, `y(t)` is the modulated signal, and `DAC(t)` is the 8-bit value sent to the DAC.
 
@@ -119,15 +119,15 @@ $$\text{DAC}(t) = 128 + (120 \cdot \text{brakeVal}) \cdot y(t)$$
 However, physical testing revealed that the continuous sine AM formula produced a soft, mushy vibration due to the mechanical limits of the sound exciter. To achieve crisp and punchy kicks, the continuous modulation was replaced with **square-wave pulse gating (12 Hz, ~65% Duty Cycle)**:
 
 $$E_{\text{ABS}}(t) = \begin{cases} 
-1 & \text{if } \left(t \bmod \frac{1}{12}\right) \le 3  \cdot \frac{1}{55} \quad (\approx 54.55\text{ ms ON}) \\
-0 & \text{if } \left(t \bmod \frac{1}{12}\right) > 3 \cdot \frac{1}{55} \quad (\approx 28.79\text{ ms OFF})
+1 & \text{if } \left(t \bmod \frac{1}{12}\right) \le 3  \cdot \frac{1}{60} \quad (\approx 50\text{ ms ON}) \\
+0 & \text{if } \left(t \bmod \frac{1}{12}\right) > 3 \cdot \frac{1}{60} \quad (\approx 33.33\text{ ms OFF})
 \end{cases}$$
 
-$$\Rightarrow y_{\text{ABS}}(t) = E_{\text{ABS}}(t) \cdot \sin(2\pi \cdot 55 \cdot t)$$
+$$\Rightarrow y_{\text{ABS}}(t) = E_{\text{ABS}}(t) \cdot \sin(2\pi \cdot 60 \cdot t)$$
 
-$$\text{DAC}_{\text{ABS}}(t) = 128 + (120 \cdot \text{brakeVal}) \cdot y_{\text{ABS}}(t) \quad (\text{active when } \text{absVal} = 1)$$
+$$\text{DAC}_{\text{ABS}}(t) = 128 + (105 \cdot \text{brakeVal}) \cdot y_{\text{ABS}}(t) \quad (\text{active when } \text{absVal} = 1)$$
 
-This ~65:35 duty cycle maintains the realistic 12 hydraulic cycles per second of an ABS system while delivering sharp, instantaneous tactile impacts to the pedal.
+This ~60:40 duty cycle (50 ms ON / 33.33 ms OFF) maintains the realistic 12 hydraulic cycles per second of an ABS system while delivering sharp, instantaneous tactile impacts to the pedal.
 
 2. **Road Effect:** 
 When the tires hit a bump or kerb or roll over uneven road surfaces, it imparts an impulse shock to the suspension. Based on previous sim racing hardware builders' experience, 75Hz is the chosen frequency with an intensity proportional to the vertical suspension displacement rate ($\Delta \text{Sus}$).
@@ -136,7 +136,7 @@ To simulate this tactile feel through the sound exciter, the amplitude is modula
 
 $$\Delta \text{Sus}(t) = \max\Big(|\text{SusL}(t) - \text{SusL}(t-1)|, \ |\text{SusR}(t) - \text{SusR}(t-1)|\Big)$$
 
-$$A_{\text{road}}(t) = \min\left(60, \ \Delta \text{Sus}(t) \cdot \frac{60}{0.06}\right)$$
+$$A_{\text{road}}(t) = \min\left(30, \ \Delta \text{Sus}(t) \cdot \frac{30}{0.06}\right)$$
 
 $$\text{DAC}_{\text{road}}(t) = A_{\text{road}}(t) \cdot \sin(2\pi \cdot 100 \cdot t)$$
 
@@ -150,8 +150,8 @@ According to **Pacejka's $\mu\text{–Slip}$ Magic Formula curve** (*Tire and Ve
 
 To provide intuitive driver feedback without unnecessary foot fatigue during normal braking, a **threshold deadband of $\text{Slip} = 0.30$** is implemented:
 - **$\text{Slip} < 0.30$ (Optimal Grip Zone):** The pedal remains completely smooth, confirming to the driver that braking is operating within the maximum traction envelope.
-- **$0.30 \le \text{Slip} < 1.50$ (Progressive Scrub / Impending Lock-up):** The exciter vibrates at 45 Hz with an amplitude scaling linearly from $20 \rightarrow 50$, warning the driver to modulate brake pressure before a full lock-up occurs.
-- **$\text{Slip} \ge 1.50$ (Full Lock-up):** Continuous maximum 45 Hz vibration (capped at 50) prompting an immediate brake release.
+- **$0.30 \le \text{Slip} < 1.50$ (Progressive Scrub / Impending Lock-up):** The exciter vibrates at 45 Hz with an amplitude scaling linearly from $10 \rightarrow 37$, warning the driver to modulate brake pressure before a full lock-up occurs.
+- **$\text{Slip} \ge 1.50$ (Full Lock-up):** Continuous maximum 45 Hz vibration (capped at 37) prompting an immediate brake release.
 
 $$
 \begin{aligned}
@@ -165,8 +165,8 @@ Where the amplitude $A_{\text{slip}}(t)$ is defined by the piecewise mapping fun
 $$
 A_{\text{slip}}(t) = \begin{cases} 
 0 & \text{if } \text{Slip}_{\text{front}} < 0.30 \quad (\text{Optimal Grip / Peak Friction}) \\
-20 + 30 \cdot \left( \frac{\text{Slip}_{\text{front}} - 0.30}{1.50 - 0.30} \right) & \text{if } 0.30 \le \text{Slip}_{\text{front}} < 1.50 \quad (\text{Progressive Slip}) \\
-50 & \text{if } \text{Slip}_{\text{front}} \ge 1.50 \quad (\text{Full Lock-up})
+10 + 27 \cdot \left( \frac{\text{Slip}_{\text{front}} - 0.30}{1.50 - 0.30} \right) & \text{if } 0.30 \le \text{Slip}_{\text{front}} < 1.50 \quad (\text{Progressive Slip}) \\
+37 & \text{if } \text{Slip}_{\text{front}} \ge 1.50 \quad (\text{Full Lock-up})
 \end{cases}
 $$
 
@@ -177,9 +177,9 @@ $$
 | Slip Value ($\text{Slip}_{\text{front}}$) | Tire Physical State (Pacejka Model) | Amplitude Formula ($A_{\text{slip}}$) | Output Amplitude ($A$) | Tactile Perception / Driver Feedback |
 |---|---|---|---|---|
 | **$0.00 \le \text{Slip} < 0.30$** | **Optimal Grip** *(Peak friction zone, $\mu \le \mu_{\max}$)* | $A = 0$ | **$0$ (Off)** | Pedal remains completely smooth; maximum braking efficiency. |
-| **$0.30 \le \text{Slip} < 0.80$** | **Light Slip** *(Exceeding peak grip boundary)* | $A = 20 + 30 \cdot \left(\frac{\text{Slip} - 0.3}{1.2}\right)$ | **$20 \rightarrow 32$** | Smooth, subtle 45 Hz rumble indicating tire scrub. |
-| **$0.80 \le \text{Slip} < 1.50$** | **Heavy Slip** *(Approaching full lock-up)* | $A = 20 + 30 \cdot \left(\frac{\text{Slip} - 0.3}{1.2}\right)$ | **$32 \rightarrow 50$** | Strong, distinct vibration warning the driver to modulate brake pressure. |
-| **$\text{Slip} \ge 1.50$** | **Full Lock-up** *(Wheel rotation halted)* | $A = 50$ (Capped) | **$50$ (Max)** | Heavy continuous 45 Hz rumble prompting immediate brake release. |
+| **$0.30 \le \text{Slip} < 0.80$** | **Light Slip** *(Exceeding peak grip boundary)* | $A = 10 + 27 \cdot \left(\frac{\text{Slip} - 0.3}{1.2}\right)$ | **$10 \rightarrow 21$** | Smooth, subtle 45 Hz rumble indicating tire scrub. |
+| **$0.80 \le \text{Slip} < 1.50$** | **Heavy Slip** *(Approaching full lock-up)* | $A = 10 + 27 \cdot \left(\frac{\text{Slip} - 0.3}{1.2}\right)$ | **$21 \rightarrow 37$** | Strong, distinct vibration warning the driver to modulate brake pressure. |
+| **$\text{Slip} \ge 1.50$** | **Full Lock-up** *(Wheel rotation halted)* | $A = 37$ (Capped) | **$37$ (Max)** | Heavy continuous 45 Hz rumble prompting immediate brake release. |
 
 
 ### Signal Mixing & Headroom Management
@@ -187,24 +187,7 @@ $$
 When all 3 effects happen at the same time (e.g. braking hard (ABS) while hitting a bump (Road effect) while on a slippery surface (Tire slip)), the amplitudes of the 3 effects will add together :
     $$y_{\text{total}}(t) = y_{\text{ABS}}(t) + y_{\text{Slip}}(t) + y_{\text{Road}}(t)$$
 
-This cause clipping (the DAC returned 255 in a period). To prevent the signal from clipping (distorting), a weighted priority mixing algorithm is applied :
-
-$$\text{Output}(t) = 128 + \sum_{i} \Big( w_i \cdot y_i(t) \Big)$$
-where $\sum w_i \le 1.0$, ensuring all combined waveforms stay within safe headroom limits while maintaining distinct feedback clarity.
-
-
-Here is the weighted mixing lookup table:
-
-| State / Combination | Bitmask `[b2 b1 b0]`<br>*(Slip · Road · ABS)* | $w_{\text{ABS}}$<br>*(Bit 0)* | $w_{\text{Road}}$<br>*(Bit 1)* | $w_{\text{Slip}}$<br>*(Bit 2)* | Total Weight<br>($\sum w_i$) | Tactile Feedback Rationale |
-|---|:---:|:---:|:---:|:---:|:---:|---|
-| **Idle / None** | `0b000` (0) | $0.00$ | $0.00$ | $0.00$ | $0.00$ | Signal stays at DAC quiescent midpoint (128). |
-| **ABS Only** | `0b001` (1) | **$1.00$ (100%)** | $0.00$ | $0.00$ | $1.00$ | Full ABS hydraulic pulsation without attenuation. |
-| **Road Effect Only** | `0b010` (2) | $0.00$ | **$1.00$ (100%)** | $0.00$ | $1.00$ | Full suspension displacement & kerb rumble. |
-| **ABS + Road** | `0b011` (3) | **$0.75$ (75%)** | **$0.25$ (25%)** | $0.00$ | $1.00$ | Dominant ABS pulse with background surface texture. |
-| **Tire Slip Only** | `0b100` (4) | $0.00$ | $0.00$ | **$1.00$ (100%)** | $1.00$ | Full 45 Hz tire scrub and impending lock-up warning. |
-| **ABS + Tire Slip** | `0b101` (5) | **$0.70$ (70%)** | $0.00$ | **$0.30$ (30%)** | $1.00$ | Primary ABS intervention with distinct tire scrub cue. |
-| **Slip + Road** | `0b110` (6) | $0.00$ | **$0.45$ (45%)** | **$0.55$ (55%)** | $1.00$ | Balanced chassis road impact and progressive tire scrub. |
-| **All 3 Active** | `0b111` (7) | **$0.65$ (65%)** | **$0.15$ (15%)** | **$0.20$ (20%)** | $1.00$ | Critical ABS feedback dominates; road & slip remain distinct. |
+So, choosing 105 for ABS, 37 for slip and 30 for road effect is the best choice to prevent the signal from clipping (distorting). (105 + 37 + 30 = 127 ~= 255  2 which is the maximum value the DAC can send);
 
 # Hardware implementation
 - ESP32 DevKit V1 — microcontroller that receives telemetry from the PC through get_telemetry() and generates the control waveform
@@ -222,8 +205,80 @@ Here is the weighted mixing lookup table:
 # Firmware/software implementation
 
 
+### Software :
 
-# Testing & calibration methodology
+- CLI version : read_and_send.cpp
+- GUI version : get_telemetry.exe
+
+- C++ was used for best performance and reduce packet loss or late data transfer when sending the game telemetry data to ESP32
+
+
+### Firmware :
+
+- Dual core computing (parallel computing): 
+1. Using Core 0 for reading telemetry data from the game and assigning the global variables.
+2. Using Core 1 for generating waveform (ABS, Slip, Road effect) (EMA smoothing, etc.) and sending it to DAC using hardware timer and interrupt with sampling rate of 5000Hz.
+
+- Status indicator using LED when telemetry packets are actively received and zero loss.
+
+- Performance and resources :
+1. Core 0 utilizes less than 0.2% and Core 1 utilizes less than 0.75% of CPU capacity, reducing latency and performance overhead to nearly 0%.
+2. Memory usage is minimal, with only a few kilobytes of RAM used for storing telemetry data and global variables.
+
+
+
+### How it works :
+
+```mermaid
+flowchart TD
+    subgraph AC ["1. Assetto Corsa (Game Engine)"]
+        GameLoop["Physics Engine (acs.exe)"]
+        SharedMem[("Windows Shared Memory\n'Local\\acpmf_physics'")]
+        GameLoop -->|"Writes physics data @ 120 Hz"| SharedMem
+    end
+
+    subgraph Host ["2. C++ Software Bridge (get_telemetry / read_and_send.cpp)"]
+        MapFile["Memory Mapping\n(MapViewOfFile)"]
+        StructMap["Cast raw buffer to struct\n(SPageFilePhysics* via structed_file.h)"]
+        
+        subgraph ExtractData ["Data Extraction (6 Channels)"]
+            Val1["pf->abs (ABS Active Flag)"]
+            Val2["pf->brake (Brake Pedal Pressure: 0.0 - 1.0)"]
+            Val3["pf->wheelSlip[0, 1] (FL & FR Longitudinal Slip)"]
+            Val4["pf->suspensionTravel[0, 1] (FL & FR Suspension Travel)"]
+        end
+
+        FormatPacket["Format CSV String Buffer\n'abs,brake,slipL,slipR,susL,susR\\n'"]
+        SerialWrite["Win32 Serial Interface (WriteFile)\n115200 Baud / 8-N-1 @ 120 Hz"]
+
+        SharedMem -->|"Read buffer"| MapFile
+        MapFile -->|"Structured deserialization"| StructMap
+        StructMap --> ExtractData
+        ExtractData --> FormatPacket
+        FormatPacket --> SerialWrite
+    end
+
+    subgraph ESP ["3. ESP32 Microcontroller (Firmware)"]
+        UARTCore0["Core 0: UART Receiver Task\nsscanf CSV payload into floats"]
+        EMA["EMA Step-Response Filtering\n(alpha = 0.072 / 42 ISR ticks)"]
+        TimerCore1["Core 1: 5000 Hz Hardware Timer ISR\nWaveform Synthesis (ABS 60Hz + Road 100Hz + Slip 50Hz)"]
+        DAC["8-Bit Hardware DAC (GPIO 25)\nDirect Register: RTC_IO_PAD_DAC1_REG"]
+
+        SerialWrite -->|"USB-UART Virtual COM Port"| UARTCore0
+        UARTCore0 --> EMA
+        EMA --> TimerCore1
+        TimerCore1 --> DAC
+    end
+
+    classDef game fill:#1a237e,stroke:#3949ab,stroke-width:2px,color:#ffffff;
+    classDef host fill:#004d40,stroke:#00897b,stroke-width:2px,color:#ffffff;
+    classDef esp fill:#bf360c,stroke:#f4511e,stroke-width:2px,color:#ffffff;
+
+    class GameLoop,SharedMem game;
+    class MapFile,StructMap,Val1,Val2,Val3,Val4,FormatPacket,SerialWrite host;
+    class UARTCore0,EMA,TimerCore1,DAC esp;
+```
+
 
 # Results/Demo
 
