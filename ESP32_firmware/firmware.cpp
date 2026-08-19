@@ -21,8 +21,8 @@ float SusR    = 0.0f;
 const float dt = 1.0f / SAMPLE_RATE;
 
 
-float cur_slip = 0.0f, cur_sus = 0.0f;
-float pre_absVal = 0.0f, pre_brakeVal = 0.0f, pre_slip = 0.0f, pre_sus = 0.0f;
+float cur_slip = 0.0f, cur_susL = 0.0f, cur_susR = 0.0f;
+float pre_absVal = 0.0f, pre_brakeVal = 0.0f, pre_slip = 0.0f, pre_susL = 0.0f, pre_susR = 0.0f;
 
 void serial_read(void *pvParameters) {
     for (;;) {
