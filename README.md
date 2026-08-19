@@ -170,16 +170,16 @@ A_{\text{slip}}(t) = \begin{cases}
 \end{cases}
 $$
 
-**Note :** 45Hz is the chosen frequency based on previous sim racing DIY builders' experience.
+**Note :** 50Hz is the chosen frequency based on previous sim racing DIY builders' experience and physical testing.
 
 ### Tire Slip Mapping & Perception Breakdown:
 
 | Slip Value ($\text{Slip}_{\text{front}}$) | Tire Physical State (Pacejka Model) | Amplitude Formula ($A_{\text{slip}}$) | Output Amplitude ($A$) | Tactile Perception / Driver Feedback |
 |---|---|---|---|---|
-| **$0.00 \le \text{Slip} < 0.30$** | **Optimal Grip** *(Peak friction zone, $\mu \le \mu_{\max}$)* | $A = 0$ | **$0$ (Off)** | Pedal remains completely smooth; maximum braking efficiency. |
-| **$0.30 \le \text{Slip} < 0.80$** | **Light Slip** *(Exceeding peak grip boundary)* | $A = 10 + 27 \cdot \left(\frac{\text{Slip} - 0.3}{1.2}\right)$ | **$10 \rightarrow 21$** | Smooth, subtle 45 Hz rumble indicating tire scrub. |
-| **$0.80 \le \text{Slip} < 1.50$** | **Heavy Slip** *(Approaching full lock-up)* | $A = 10 + 27 \cdot \left(\frac{\text{Slip} - 0.3}{1.2}\right)$ | **$21 \rightarrow 37$** | Strong, distinct vibration warning the driver to modulate brake pressure. |
-| **$\text{Slip} \ge 1.50$** | **Full Lock-up** *(Wheel rotation halted)* | $A = 37$ (Capped) | **$37$ (Max)** | Heavy continuous 45 Hz rumble prompting immediate brake release. |
+| **$0.00 \le \text{Slip} < 0.30$** | **Optimal Grip** (Peak friction zone, $\mu \le \mu_{\text{max}}$) | $A = 0$ | **$0$ (Off)** | Pedal remains completely smooth; maximum braking efficiency. |
+| **$0.30 \le \text{Slip} < 0.80$** | **Light Slip** (Exceeding peak grip boundary) | $A = 10 + 27 \cdot \left(\frac{\text{Slip} - 0.3}{1.2}\right)$ | **$10 \rightarrow 21$** | Smooth, subtle 50 Hz rumble indicating tire scrub. |
+| **$0.80 \le \text{Slip} < 1.50$** | **Heavy Slip** (Approaching full lock-up) | $A = 10 + 27 \cdot \left(\frac{\text{Slip} - 0.3}{1.2}\right)$ | **$21 \rightarrow 37$** | Strong, distinct vibration warning the driver to modulate brake pressure. |
+| **$\text{Slip} \ge 1.50$** | **Full Lock-up** (Wheel rotation halted) | $A = 37$ (Capped) | **$37$ (Max)** | Heavy continuous 50 Hz rumble prompting immediate brake release. |
 
 
 ### Signal Mixing & Headroom Management
