@@ -38,7 +38,7 @@
 
 ### Testing 
 
-- ABS with Amplitude modulation (60Hz - 12Hz) : [Here](Videos/1882026-AM.mp4)
+- ABS with Amplitude modulation (60Hz - 12Hz) : [Here](https://youtube.com/shorts/pjtzisKoqhs?feature=share)
 - **Comment** : Weak intensity even at max amplitude due to the sound exciter's physical limitations. 
 
 
@@ -51,9 +51,9 @@
 
 ### Testing all effects
 
-- Demo video (ABS) : [Here](Videos/abs.mp4)
-- Demo video (slip effect) : [Here](Videos/slip_effect.mp4)
-- Demo video (road effect) : [Here](Videos/road_effect.mp4)
+- Demo video (ABS) : [Here](https://youtube.com/shorts/HPPclNWR_eQ)
+- Demo video (slip effect) : [Here](https://youtube.com/shorts/F_2Ib3Tkiu4?feature=share)
+- Demo video (road effect) : [Here](https://youtube.com/shorts/F_2Ib3Tkiu4?feature=share)
 
 
 
