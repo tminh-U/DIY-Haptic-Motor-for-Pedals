@@ -11,7 +11,7 @@ This project is a DIY guide to building a haptic feedback system for sim racing 
 
 | Criteria | Eccentric motor (ERM) | Soundcard + bass shaker | This project (ESP32 + exciter) |
 |---|---|---|---|
-| **Cost** | Low |This project is a DIY guide to building a haptic feedback system for sim racing pedals, using a custom controller to simulate **ABS pulse** and **road effect** - especially on the brake pedal. It addresses one of the most significant limitations of load-cell pedals: the lack of ABS and lock-up feedback during trail-braking. High | Low |
+| **Cost** | Low | High | Low |
 | **Response speed** | Slow (motor needs time to spin up/down) | Instant | Instant (Fastest) |
 | **Vibration range** | Narrow, limited control | Wide, full control over frequency and amplitude | Acceptable, good enough for the target effects |
 | **Safety** | Safe | Risk of damaging the laptop's soundcard or onboard audio circuit | Fully safe (isolated from the PC) |
@@ -117,14 +117,16 @@ After analyzing various $\alpha$ values, $\alpha = 0.01131$ was chosen because i
 ### How all of the effects are calculated in this module:
 1. **ABS:** In real life, ABS pulse is caused by the hydraulic modulator releasing and reapplying brake pressure rapidly 10–15 times per second (Bosch Automotive Handbook), so the frequency is set to 12 Hz, which is the sweet spot for ABS. Because sound exciters have poor low-frequency response at 12 Hz, Amplitude Modulation (AM) is used - modulating a 60 Hz carrier wave with a 12 Hz sine envelope to maximize tactile feedback strength while preserving the realistic frequency. Since `absVal` is a boolean telemetry flag (0 or 1), driver brake pedal pressure (`brakeVal`) is used to scale the vibration amplitude dynamically:
 
-$$y_{\text{carrier}}(t) = \sin(2\pi \cdot 60 \cdot t)$$
-$$y_{\text{mod}}(t) = \sin(2\pi \cdot 12 \cdot t)$$
+~~$$y_{\text{carrier}}(t) = \sin(2\pi \cdot 60 \cdot t)$$~~
+~~$$y_{\text{mod}}(t) = \sin(2\pi \cdot 12 \cdot t)$$~~
 
-$$\Rightarrow y(t) = \left( \frac{1 + \sin(2\pi \cdot 12 \cdot t)}{2} \right) \cdot \sin(2\pi \cdot 60 \cdot t)$$
+~~$$\Rightarrow y(t) = \left( \frac{1 + \sin(2\pi \cdot 12 \cdot t)}{2} \right) \cdot \sin(2\pi \cdot 60 \cdot t)$$~~
 
-$$\text{DAC}(t) = 128 + (105 \cdot \text{brakeVal}) \cdot y(t)$$
+~~$$\text{DAC}(t) = 128 + (105 \cdot \text{brakeVal}) \cdot y(t)$$~~
 
-**Note:** `brakeVal` is the normalized brake pedal pressure ($0.0 \le \text{brakeVal} \le 1.0$) from telemetry, `y(t)` is the modulated signal, and `DAC(t)` is the 8-bit value sent to the DAC.
+~~**Note:** `brakeVal` is the normalized brake pedal pressure ($0.0 \le \text{brakeVal} \le 1.0$) from telemetry, `y(t)` is the modulated signal, and `DAC(t)` is the 8-bit value sent to the DAC.~~
+
+*(Deprecated - see the 18/8/2026 Update below for the revised approach)*
 
 **[18/8/2026 Update - Square-Wave Pulse Gating]:**
 
@@ -208,7 +210,22 @@ $$
 When all 3 effects happen at the same time (e.g. braking hard (ABS) while hitting a bump (Road effect) while on a slippery surface (Tire slip)), the amplitudes of the 3 effects will add together :
     $$y_{\text{total}}(t) = y_{\text{ABS}}(t) + y_{\text{Slip}}(t) + y_{\text{Road}}(t)$$
 
-So, choosing 105 for ABS, 37 for slip and 30 for road effect is the best choice to prevent the signal from clipping (distorting). (105 + 37 + 30 = 127 ~= 255  2 which is the maximum value the DAC can send);
+So, to prevent the signal from clipping and disorting, a weighted system using a LUT (look-up table) is applied :
+
+| State (Bit 2,1,0) | Active Effects | ABS Weight | Road Weight | Slip Weight | Total Weight |
+| :---: | :--- | :---: | :---: | :---: | :---: |
+| `000` | None | `0.00` | `0.00` | `0.00` | `0.00` |
+| `001` | ABS only | `1.00 * H_M` | `0.00` | `0.00` | `1.00 * H_M` |
+| `010` | Road only | `0.00` | `1.00 * H_M` | `0.00` | `1.00 * H_M` |
+| `011` | ABS + Road | `0.75 * H_M` | `0.25 * H_M` | `0.00` | `1.00 * H_M` |
+| `100` | Slip only | `0.00` | `0.00` | `1.00 * H_M` | `1.00 * H_M` |
+| `101` | ABS + Slip | `0.85 * H_M` | `0.00` | `0.15 * H_M` | `1.00 * H_M` |
+| `110` | Road + Slip | `0.00` | `0.35 * H_M` | `0.65 * H_M` | `1.00 * H_M` |
+| `111` | ABS + Road + Slip | `0.60 * H_M` | `0.25 * H_M` | `0.15 * H_M` | `1.00 * H_M` |
+
+Where the Headroom Multiplier ($H_M$) is calculated as:
+$$H_M = \frac{\text{Max DAC Amplitude}}{\text{Max ABS} + \text{Max Road} + \text{Max Slip}} = \frac{127}{120 + 70 + 85} \approx 0.4618$$
+
 
 # Hardware implementation
 - ESP32 DevKit V1 - microcontroller that receives telemetry from the PC through get_telemetry() and generates the control waveform
