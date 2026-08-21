@@ -82,34 +82,31 @@ float curg_absVal = 0.0f, curg_slip = 0.0f, curg_delta_sus = 0.0f;
 
 
 struct weightmp {
-    float brake, sus, slip;
+    float abs, sus, slip;
 };
 
-/*
+
+const float H_M = 127.0f / (120.0f + 85.0f + 70.0f);
+
 const weightmp mp[8] = {
-    //ABS(bit0)   Road(bit1)  Slip(bit2)
-   { 0.00f,      0.00f,      0.00f },
-   { 1.00f,      0.00f,      0.00f },
-   { 0.00f,      1.00f,      0.00f },
-   { 0.75f,      0.25f,      0.00f },
-   { 0.00f,      0.00f,      1.00f },
-   { 0.70f,      0.00f,      0.30f },
-   { 0.00f,      0.45f,      0.55f },
-   { 0.65f,      0.15f,      0.20f }
+    //ABS(bit0)         Road(bit1)        Slip(bit2)
+   { 0.00f * H_M,      0.00f * H_M,      0.00f * H_M },
+   { 1.00f * H_M,      0.00f * H_M,      0.00f * H_M },
+   { 0.00f * H_M,      1.00f * H_M,      0.00f * H_M },
+   { 0.75f * H_M,      0.25f * H_M,      0.00f * H_M },
+   { 0.00f * H_M,      0.00f * H_M,      1.00f * H_M },
+   { 0.85f * H_M,      0.00f * H_M,      0.15f * H_M },
+   { 0.00f * H_M,      0.35f * H_M,      0.65f * H_M },
+   { 0.60f * H_M,      0.25f * H_M,      0.15f * H_M }
 };
 
-void Mix(float &brake, float &sus, float &slip) {
-    bool bit0 = (brake >= EPS);
-    bool bit1 = (sus >= EPS);
+inline weightmp IRAM_ATTR Mix(float &abs, float &sus, float &slip) {
+    bool bit0 = (abs >= eps);
+    bool bit1 = (sus >= eps);
     bool bit2 = (slip > 0.3f);
-
-    uint8_t mask = bit0 | (bit1 << 1) | (bit2 << 2);
-
-    brake *= mp[mask].brake;
-    sus *= mp[mask].sus;
-    slip *= mp[mask].slip;
+    return mp[bit0 | (bit1 << 1) | (bit2 << 2)];
 }
-*/
+
 
 const int LUT_SIZE = 1024;
 
@@ -120,7 +117,7 @@ float phase_abs = 0.0f, phase_slip = 0.0f, phase_sus = 0.0f;
 
 float LUT[1024];
 
-bool flag = true;
+bool flag = true, weight_flag = false;
 uint32_t swap_counter = 0;
 
 
@@ -136,6 +133,8 @@ inline uint32_t IRAM_ATTR xorshift32() {
 }
 
 
+float curg_weight_absVal = 0.0f, curg_weight_sus = 0.0f, curg_weight_slip = 0.0f;
+
 
 void IRAM_ATTR calc_effect() {
 
@@ -144,29 +143,43 @@ void IRAM_ATTR calc_effect() {
     curg_slip = EMAsmooth(cur_slip, curg_slip);
 
 
+
+    weightmp cur_weight = Mix(cur_absVal, curg_delta_sus, curg_slip);
+    if (!weight_flag) {
+        curg_weight_absVal = cur_weight.abs;
+        curg_weight_sus = cur_weight.sus;
+        curg_weight_slip = cur_weight.slip;
+        weight_flag = true;
+    } else {
+        curg_weight_absVal = EMAsmooth(cur_weight.abs, curg_weight_absVal);
+        curg_weight_sus = EMAsmooth(cur_weight.sus, curg_weight_sus);
+        curg_weight_slip = EMAsmooth(cur_weight.slip, curg_weight_slip);
+    }
+
+
     //ABS : (freq : 50 -> 60hz, amplitude : Max 105, but interupt with 12hz freq)
     //The magnitude of ABS will change the amplitude. (120 * absVal)
-    float abs_effect = (t_abs <= 800 ? (60.0f * curg_absVal) * LUT[int(phase_abs) & 1023] : 0.0f);
+    float abs_effect = (t_abs <= 800 ? (120.0f * curg_absVal) * LUT[int(phase_abs) & 1023] : 0.0f) * curg_weight_absVal;
 
-    //road effect : (freq : 100 -> 120hz, amplitude : Max 30)
+    //road effect : (freq : 100 -> 120hz, amplitude : Max 70)
     //Maximum delta = 0.06m
-    //The delta between magnitude of suspension will change the amplitude. ((30 / 0.06) * delta(Max(SusL, SusR)))
+    //The delta between magnitude of suspension will change the amplitude. ((70 / 0.06) * delta(Max(SusL, SusR)))
 
-    float a_road = (curg_delta_sus > 0 ? curg_delta_sus : -curg_delta_sus) * (30.0f / 0.06f);
-    a_road = (a_road < 30.0f ? a_road : 30.0f);
+    float a_road = (curg_delta_sus > 0 ? curg_delta_sus : -curg_delta_sus) * (70.0f / 0.06f);
+    a_road = (a_road < 70.0f ? a_road : 70.0f);
 
-    float road_effect = a_road * LUT[int(phase_sus) & 1023];
+    float road_effect = curg_weight_sus * a_road * LUT[int(phase_sus) & 1023];
 
-    //Tire slip : (freq : ~45hz, amplitude : 10 - 37)
+    //Tire slip : (freq : ~45hz, amplitude : 30 - 85)
     float a_slip = 0.0f;
     if (curg_slip < 0.3f) {
         a_slip = 0.0f;
     } else if (curg_slip <= 1.5f) {
-        a_slip = 10.0f + 27.0f * (curg_slip - 0.3f) / (1.5f - 0.3f); 
+        a_slip = 30.0f + 55.0f * (curg_slip - 0.3f) / (1.5f - 0.3f); 
     } else if (curg_slip > 1.5) {
-        a_slip = 37.0f;
+        a_slip = 85.0f;
     }
-    float slip_effect = a_slip * LUT[int(phase_slip) & 1023];
+    float slip_effect = a_slip * LUT[int(phase_slip) & 1023] * curg_weight_slip;
 
     float total = 128 + (abs_effect + road_effect + slip_effect);
     total = (total > 0.0f ? total : 0);
