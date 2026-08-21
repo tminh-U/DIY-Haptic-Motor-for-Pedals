@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <timeapi.h>
 #include <iostream>
 #include <string>
 #include <cmath>
@@ -6,9 +7,11 @@
 #include <thread>
 #include "structed_file.h"
 
+#pragma comment(lib, "winmm.lib")
+
 using namespace std;
 
-const int HZ = 120;
+const int HZ = 60;
 const auto DURATION = chrono::microseconds(1000000 / HZ);
 
 HANDLE hSerial = INVALID_HANDLE_VALUE;
@@ -57,72 +60,100 @@ void dismiss(SMElement element) {
 	CloseHandle(element.hMapFile);
 }
 
-//get data from shared memory
+//get data from shared memory (open only, do not create)
 bool initPhysics() {
-	TCHAR szName[] = TEXT("Local\\acpmf_physics");
-	m_physics.hMapFile = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(SPageFilePhysics), szName);
+	m_physics.hMapFile = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\acpmf_physics");
 	if (!m_physics.hMapFile) return false;
 	m_physics.mapFileBuffer = (unsigned char*)MapViewOfFile(m_physics.hMapFile, FILE_MAP_READ, 0, 0, sizeof(SPageFilePhysics));
 	if (!m_physics.mapFileBuffer) return false;
     return true;
 }
 
-void sendDataToESP32(float absActive, float brake, float wheelSlipL, float wheelSlipR, float SusL, float SusR) {
+void sendDataToESP32(float absActive, float wheelSlipL, float wheelSlipR, float SusL, float SusR) {
     if (hSerial == INVALID_HANDLE_VALUE) return;
     char buffer[64];
-    int len = sprintf_s(buffer, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", absActive, brake, wheelSlipL, wheelSlipR, SusL, SusR);
+    int len = sprintf_s(buffer, "%.4f,%.4f,%.4f,%.4f,%.4f\n", absActive, wheelSlipL, wheelSlipR, SusL, SusR);
     DWORD bytesWritten;
     WriteFile(hSerial, buffer, len, &bytesWritten, NULL);
 }
 
 int main() {
+    timeBeginPeriod(1);
+    string com;
     // Connect to ESP32 (change "\\\\.\\COM3" to your actual COM port if needed)
 
-    string com = "COM3";
+    
+    cout << "COM INPUT (e.g COM3) :";
+    cin >> com;
+
     string fullPort = "\\\\.\\" + com;
     initSerial(fullPort.c_str());
 
     while(true) {
 
-        if (!initPhysics()) this_thread::sleep_for(chrono::seconds(1))
+        if (!initPhysics()) {
+            this_thread::sleep_for(chrono::seconds(1));
+            continue;
+        }
         
 
         cout << "Game detected" << endl;
         SPageFilePhysics* pf = (SPageFilePhysics*)m_physics.mapFileBuffer;
         auto next_frame = chrono::steady_clock::now();
 
-        int lstid = -1, cnt = 0;
-        while (true) {        
+        int lstid = pf->packetId, cnt = 0;
+        bool isFresh = false;
+
+        while (true) {
             next_frame += DURATION;
-            
-            if (pf->packetID == lstid) {
+
+            if (pf->packetId == lstid) {
                 ++cnt;
                 if (cnt > 240) {
                     cout << "Waiting of acs.exe" << endl;
+                    sendDataToESP32(0, 0, 0, 0, 0);
                     break;
                 }
+            } else {
+                cnt = 0;
+                lstid = pf->packetId;
+                isFresh = true;
             }
 
+            if (!isFresh || cnt > 20) {
+                // Game paused or just connected
+                sendDataToESP32(0, 0, 0, 0, 0);
+            } else {
+                // Read telemetry values
+                float speedKmh = pf->speedKmh;
+                // Force slip to 0 if speed < 3 km/h to eliminate physics noise at a standstill
+                float slipValL = (speedKmh > 3.0f) ? pf->wheelSlip[0] : 0.0f; 
+                float slipValR = (speedKmh > 3.0f) ? pf->wheelSlip[1] : 0.0f; 
+                float SusL = pf->suspensionTravel[0]; // FL suspension
+                float SusR = pf->suspensionTravel[1]; // FR suspension
 
-            // Read telemetry values
-            float absVal = pf->abs;
-            float brakeVal = pf->brake;
-            float slipValL = pf->wheelSlip[0]; // Front-left wheel slip
-            float slipValR = pf->wheelSlip[1]; // Front-right wheel slip
-            float SusL = pf->suspensionTravel[0]; // FL suspension
-            float SusR = pf->suspensionTravel[1]; // FR suspension
 
-            // Send packet to ESP32
-            sendDataToESP32(absVal, brakeVal, slipValL, slipValR, SusL, SusR);
+
+                // bool flag = true;
+                // for (int i = 0; i < 4; ++i) if (pf->wheelAngularSpeed[i] > 1.0f) flag = false;
+
+
+                // Detect ABS via wheelSlip + brake (AC1's abs field is unreliable)
+                float absActive = ((pf->brake > 0.05f) && (max(slipValL, slipValR) >= 0.8f) && (pf->abs > 0.0f)) ? 1.0f : 0.0f;
+
+                // Send packet to ESP32
+                sendDataToESP32(absActive, slipValL, slipValR, SusL, SusR);
+            }
+
             this_thread::sleep_until(next_frame);
         }
 
         dismiss(m_physics);
-        if (hSerial != INVALID_HANDLE_VALUE) {
-            CloseHandle(hSerial);
-        }
+    }
+    if (hSerial != INVALID_HANDLE_VALUE) {
+        CloseHandle(hSerial);
     }
 
-    
+    timeEndPeriod(1);
     return 0;
 }

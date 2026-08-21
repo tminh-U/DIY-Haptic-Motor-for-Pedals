@@ -22,47 +22,67 @@ volatile float delta_sus = 0.0f, cur_slip = 0.0f, cur_absVal = 0.0f;
 
 char buffer[64];
 void serial_read(void *pvParameters) {
-    unsigned long lastValidPacket = millis();
+    int test_mode = 0;
+    unsigned long last_cycle_time = 0;
+    int cycle_step = 0;
+
     for (;;) {
         if (Serial.available() > 0) {
-                size_t len = Serial.readBytesUntil('\n', buffer, sizeof(buffer) - 1);
-
-                if (len > 0) {
-                    buffer[len] = '\0';
-                    pre_susL = cur_susL;
-                    pre_susR = cur_susR;
-                }
+            char c = Serial.read();
+            if (c >= '0' && c <= '3') {
+                test_mode = c - '0';
+                cycle_step = 0;
+                last_cycle_time = millis();
                 
-                float absVal, susL, susR;
-                int count = sscanf(buffer, "%f, %f, %f, %f, %f", &absVal, &slipL, &slipR, &susL, &susR);
-
-                if (count == 5) {
-                    float dL = fabsf(susL - pre_susL);
-                    float dR = fabsf(susR - pre_susR);
-
-                    //UART noise filter
-                    if (dL < 0.1f && dR < 0.1f) {
-                        cur_susL = susL;
-                        cur_susR = susR;
-                        cur_absVal = absVal;
-                        delta_sus = max(dL, dR);
-                        cur_slip = max(slipL, slipR);
-                        lastValidPacket = millis();
-                        digitalWrite(LED_PIN, HIGH);
-                    }
+                if (test_mode == 0) {
+                    cur_absVal = 0.0f;
+                    delta_sus = 0.0f;
+                    cur_slip = 0.0f;
+                    digitalWrite(LED_PIN, LOW);
+                    Serial.println("Test: OFF");
+                } else if (test_mode == 1) {
+                    cur_absVal = 1.0f;
+                    delta_sus = 0.0f;
+                    cur_slip = 0.0f;
+                    digitalWrite(LED_PIN, HIGH);
+                    Serial.println("Test: ABS Effect");
+                } else if (test_mode == 2) {
+                    cur_absVal = 0.0f;
+                    cur_slip = 0.0f;
+                    delta_sus = 0.015f; // Mức 1
+                    digitalWrite(LED_PIN, HIGH);
+                    Serial.println("Test: Road Effect - Level 1");
+                } else if (test_mode == 3) {
+                    cur_absVal = 0.0f;
+                    delta_sus = 0.0f;
+                    cur_slip = 0.6f; // Mức 1
+                    digitalWrite(LED_PIN, HIGH);
+                    Serial.println("Test: Slip Effect - Level 1");
                 }
+            }
         }
 
-        // Watchdog: if no valid data for 500ms, silence the motor
-        // MUST be outside Serial.available() so it fires even when USB is disconnected
-        if (millis() - lastValidPacket > 500) {
-            cur_absVal = 0;
-            delta_sus = 0;
-            cur_slip = 0;
-            digitalWrite(LED_PIN, LOW);
+        if (test_mode == 2) {
+            if (millis() - last_cycle_time > 1000) { // Chuyển mức mỗi 1 giây
+                cycle_step = (cycle_step + 1) % 4;
+                last_cycle_time = millis();
+                
+                float road_levels[4] = {0.015f, 0.030f, 0.045f, 0.060f};
+                delta_sus = road_levels[cycle_step];
+                Serial.printf("Test: Road Effect - Level %d\n", cycle_step + 1);
+            }
+        } else if (test_mode == 3) {
+            if (millis() - last_cycle_time > 1000) { // Chuyển mức mỗi 1 giây
+                cycle_step = (cycle_step + 1) % 4;
+                last_cycle_time = millis();
+                
+                float slip_levels[4] = {0.6f, 0.9f, 1.2f, 1.5f};
+                cur_slip = slip_levels[cycle_step];
+                Serial.printf("Test: Slip Effect - Level %d\n", cycle_step + 1);
+            }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -72,8 +92,8 @@ void serial_read(void *pvParameters) {
 
 inline float IRAM_ATTR EMAsmooth(float target_val, float prev_val, const float alpha = 0.01131f) {
     float diff = target_val - prev_val;
-    float delta = (delta < 0.0f) ? -diff : diff;
-    if (delta < 1e-4f) return target_val;
+    float abs_diff = (diff < 0.0f) ? -diff : diff;
+    if (abs_diff < 1e-4f) return target_val;
     return prev_val + alpha * diff;
 }
 
@@ -135,8 +155,6 @@ inline uint32_t IRAM_ATTR xorshift32() {
     return xorshift_state;
 }
 
-
-
 void IRAM_ATTR calc_effect() {
 
     curg_absVal = cur_absVal; // ABS should respond instantly, no EMA
@@ -191,15 +209,15 @@ void IRAM_ATTR calc_effect() {
     
 
 
-    if (curg_slip < 0.3f) {
+     if (curg_slip < 0.3f) {
         phase_slip = 0;
     } else {
         swap_counter++;
-        int random_val = (xorshift32() & 1023); 
+        int random_val = (int)(xorshift32() & 1023); 
         float factor = 0.8f + 0.4f * ((float)random_val * 0.0009765625f); // 1/1024 = 0.0009765625
         int swap_interval = (int)(640.0f * factor); // SAMPLE_RATE * 0.04 = 16000 * 0.04 = 640
         
-        if (swap_counter >= swap_interval) {
+        if ((int)swap_counter >= swap_interval) {
             flag ^= 1;
             swap_counter = 0;
         }

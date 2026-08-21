@@ -77,30 +77,36 @@ w_{\text{ABS}} \cdot \text{brakeVal}[n] & \text{if } \text{absVal} = 1 \\
 0 & \text{if } \text{absVal} = 0 
 \end{cases}$$
 
-$$y_{\text{ABS}}[n] = y_{\text{ABS}}[n-1] + 0.072 \cdot \Big(\text{Target}_{\text{ABS}}[n] - y_{\text{ABS}}[n-1]\Big)$$
+$$y[n] = y[n-1] + 0.01131 \cdot \Big(\text{Target}[n] - y[n-1]\Big)$$
 
 Where:
-- $y_{\text{ABS}}[n]$ (`curg_brakeVal`): Smoothed ABS modulation amplitude at interrupt step $n$.
-- $y_{\text{ABS}}[n-1]$: Smoothed state from the preceding $200\ \mu\text{s}$ timer interrupt cycle.
-- $\text{Target}_{\text{ABS}}[n]$: Weighted target brake demand, scaled by the dynamic mixing coefficient $w_{\text{ABS}} \in [0.0, 1.0]$.
-- $\alpha = 0.072$: Smoothing factor calibrated for $95\%$ convergence within one 120 Hz telemetry frame.
+- $y[n]$: Smoothed amplitude at interrupt step $n$.
+- $y[n-1]$: Smoothed state from the preceding $62.5\ \mu\text{s}$ timer interrupt cycle.
+- $\text{Target}[n]$: Target demand from PC.
+- $\alpha = 0.01131$: Smoothing factor calibrated for $95\%$ convergence within one 60 Hz telemetry frame.
 
 
-#### Step Response Over 42 Interrupt Cycles ($0 \rightarrow 100\%$ Step):
+#### Step Response Over 266 Interrupt Cycles ($0 \rightarrow 100\%$ Step):
+
 
 | Interrupt Step ($n$) | Elapsed Time ($t$) | Amplitude ($y[n]$) | Physical / Tactile Behavior |
-|:---:|:---:|:---:|---|
-| **$n = 0$** | $0.0\text{ ms}$ | **$0.00\%$** | New 120 Hz telemetry packet arrives via Serial |
-| **$n = 1$** | $0.2\text{ ms}$ | **$7.20\%$** | Smooth motion starts, eliminating harsh 90° square steps |
-| **$n = 5$** | $1.0\text{ ms}$ | **$31.26\%$** | Fast initial ramp-up within the first millisecond |
-| **$n = 10$** | $2.0\text{ ms}$ | **$52.75\%$** | Passes 50% strength — initial haptic cue detected by foot |
-| **$n = 14$** | $2.8\text{ ms}$ | **$64.90\%$** | Reaches standard time constant $1\tau$ ($63.2\%$ response) |
-| **$n = 20$** | $4.0\text{ ms}$ | **$77.68\%$** | Reaches ~80% strength halfway through the frame |
-| **$n = 30$** | $6.0\text{ ms}$ | **$89.45\%$** | Smooth asymptotic curve, preventing abrupt acceleration |
-| **$n = 40$** | $8.0\text{ ms}$ | **$95.02\%$** | Standard convergence threshold ($3\tau \approx 95\%$) |
-| **$n = 42$** | **$8.4\text{ ms}$** | **$95.70\%$** | Seamlessly completes transition as the next 120 Hz packet arrives |
+| --- | --- | --- | --- |
+| **$n = 0$** | $0.00\text{ ms}$ | **$0.00\%$** | New 60 Hz telemetry packet arrives via Serial. |
+| **$n = 1$** | $0.06\text{ ms}$ | **$1.13\%$** | First tiny step ($62.5\ \mu\text{s}$), removing harsh 90° square edges. |
+| **$n = 16$** | $1.00\text{ ms}$ | **$16.63\%$** | Smooth vibration ramp-up within the first 1 ms. |
+| **$n = 64$** | $4.00\text{ ms}$ | **$51.70\%$** | Passes 50% amplitude — driver foot senses the effect. |
+| **$n = 88$** | $5.50\text{ ms}$ | **$63.22\%$** | Reaches standard time constant $1\tau$ ($63.2\%$). |
+| **$n = 128$** | $8.00\text{ ms}$ | **$76.62\%$** | Reaches nearly 80% strength halfway through the frame. |
+| **$n = 192$** | $12.00\text{ ms}$ | **$88.72\%$** | Smooth asymptotic curve, preventing abrupt jerks. |
+| **$n = 256$** | $16.00\text{ ms}$ | **$94.55\%$** | Reaches standard convergence threshold (~95.0%). |
+| **$n = 266$** | **$16.63\text{ ms}$** | **$95.16\%$** | Seamlessly completes 1 frame ($16.67\text{ ms}$) as the next packet arrives. |
 
-After analyzing various $\alpha$ values, $\alpha = 0.072$ was chosen because it allows the step response to reach $\approx 95\%$ convergence within a single 120 Hz telemetry frame ($8.33\text{ ms}$), smoothly eliminating discrete steps without introducing perceptible latency.
+
+
+After analyzing various $\alpha$ values, $\alpha = 0.01131$ was chosen because it allows the step response to reach $\approx 95\%$ convergence within a single 60 Hz telemetry frame ($16.67\text{ ms}$), smoothly eliminating discrete steps without introducing perceptible latency.
+
+**[21/8/2026 Update - Fixing floating point]**
+- When using EMA smoothing with a very small $\Delta$ (where $\Delta = |\text{Target}[n] - y[n-1]|$), it may cause ESP32 fatal panics, so the $\Delta$ is limited to $\Delta \ge 10^{-4}$.
 
 ### How all of the effects are calculated in this module:
 1. **ABS:** In real life, ABS pulse is caused by the hydraulic modulator releasing and reapplying brake pressure rapidly 10–15 times per second (Bosch Automotive Handbook), so the frequency is set to 12 Hz, which is the sweet spot for ABS. Because sound exciters have poor low-frequency response at 12 Hz, Amplitude Modulation (AM) is used - modulating a 60 Hz carrier wave with a 12 Hz sine envelope to maximize tactile feedback strength while preserving the realistic frequency. Since `absVal` is a boolean telemetry flag (0 or 1), driver brake pedal pressure (`brakeVal`) is used to scale the vibration amplitude dynamically:
@@ -129,19 +135,28 @@ $$\text{DAC}_{\text{ABS}}(t) = 128 + (105 \cdot \text{brakeVal}) \cdot y_{\text{
 
 This ~60:40 duty cycle (50 ms ON / 33.33 ms OFF) maintains the realistic 12 hydraulic cycles per second of an ABS system while delivering sharp, instantaneous tactile impacts to the pedal.
 
+**[20/8/2026 Update - ABS data]:**
+There is a problem, the pf->abs in the shared memory is the stage of ABS that the current car used, not the abs engage flag. So the ABS is actived by a new formula :
+
+$$\text{absVal} = (\text{brakeVal} > 0.05 \ \land \ \max(\text{slipL}, \text{slipR}) > 0.8 \ \land \ \text{pf->abs} > 0)$$
+
 2. **Road Effect:** 
-When the tires hit a bump or kerb or roll over uneven road surfaces, it imparts an impulse shock to the suspension. Based on previous sim racing hardware builders' experience, 75Hz is the chosen frequency with an intensity proportional to the vertical suspension displacement rate ($\Delta \text{Sus}$).
+When the tires hit a big bump or kerb or, it imparts an impulse shock to the suspension. Based on previous sim racing hardware builders' experience, 75Hz is the chosen frequency with an intensity proportional to the vertical suspension displacement rate ($\Delta \text{Sus}$). However, the suspensions act like a Low-pass filter, so maybe only big kerb or bumps is clearly felt in the pedal.
+
 
 To simulate this tactile feel through the sound exciter, the amplitude is modulated by the frame-to-frame suspension velocity:
 
 $$\Delta \text{Sus}(t) = \max\Big(|\text{SusL}(t) - \text{SusL}(t-1)|, \ |\text{SusR}(t) - \text{SusR}(t-1)|\Big)$$
 
-$$A_{\text{road}}(t) = \min\left(30, \ \Delta \text{Sus}(t) \cdot \frac{30}{0.06}\right)$$
+$$A_{\text{road}}(t) = \min\left(30, \ \Delta \text{Sus}(t) \cdot \frac{30}{0.015}\right)$$
 
 $$\text{DAC}_{\text{road}}(t) = A_{\text{road}}(t) \cdot \sin(2\pi \cdot 100 \cdot t)$$
 
-**Note :** The frequency run continiously from the start. 
+**Note :**  
 
+* $0.015$$m$ is the maximum displacement of the suspension system in this build in 1 frame.
+* The frequency run continiously from the start. 
+* EMA smoothing uses an asymmetric decay ($\alpha = 0.0038$) when $\Delta\text{Sus}$ decreases to eliminate abrupt popping noises while preserving a punchy and crisp kerb impact (~95ms settling time).
 
 3. **Lock-up / Tire Slip:** 
 When the tires exceed the peak friction threshold, kinetic stick-slip friction and in-plane carcass torsional deformation generate continuous low-frequency vibrations. 
@@ -207,7 +222,7 @@ So, choosing 105 for ABS, 37 for slip and 30 for road effect is the best choice 
 
 ### Software :
 
-- CLI version : read_and_send.cpp
+- CLI version : read_and_send.exe
 - GUI version : get_telemetry.exe
 
 - C++ was used for best performance and reduce packet loss or late data transfer when sending the game telemetry data to ESP32
@@ -217,14 +232,16 @@ So, choosing 105 for ABS, 37 for slip and 30 for road effect is the best choice 
 
 - Dual core computing (parallel computing): 
 1. Using Core 0 for reading telemetry data from the game and assigning the global variables.
-2. Using Core 1 for generating waveform (ABS, Slip, Road effect) (EMA smoothing, etc.) and sending it to DAC using hardware timer and interrupt with sampling rate of 5000Hz.
+2. Using Core 1 for generating waveform (ABS, Slip, Road effect) (EMA smoothing, etc.) and sending it to DAC using hardware timer and interrupt with sampling rate of 16000Hz.
 
 - Status indicator using LED when telemetry packets are actively received and zero loss.
 
 - Performance and resources :
 1. Core 0 utilizes less than 0.2% and Core 1 utilizes less than 0.75% of CPU capacity, reducing latency and performance overhead to nearly 0%.
 2. Memory usage is minimal, with only a few kilobytes of RAM used for storing telemetry data and global variables.
+3. Although sinf(x) is O(1) time complexity, using it still costs a lot of CPU resources and time to solve, so a LUT (Look-up table) is used to reduce the CPU usage and calculation time. Also, when using a high sample rate such as 16000Hz, using the sinf(x) function may cause floating point errors and return incorrect data. Therefore, using LUT is more stable and efficient for generating waveforms. LUT formula : the circle is divided into 1024 parts, so the angle will be : $\theta = 2\pi \cdot \frac{i}{1024}$, so $\sin \theta = \sin(2\pi \cdot \frac{i}{1024})$ where $i$ is the index of the LUT. And a sine wave step after a single sampling is calculated by $\frac{\text{frequency} \times 1024}{\text{sample\_rate}}$. For example, ABS at 60Hz with 16000Hz sample rate : $\frac{60 \times 1024}{16000} = 3.84$.
 
+4. Because the hardware timer interrupt runs from internal RAM (`IRAM_ATTR`), using `<cmath>` library functions (like `fminf`, `fabsf`, `fmaxf`, etc.) can cause the ESP32 to crash. These functions are stored in external SPI Flash, and accessing them during an interrupt when the flash cache is disabled will result in a fatal panic. Therefore, basic conditional statements are used instead.
 
 
 ### How it works :
