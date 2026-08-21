@@ -322,6 +322,8 @@ flowchart TD
 
 # Results/Demo
 
+**See here :** [BUILD_LOG.md](BUILD_LOG.md)
+
 
 # Academic & Technical References
 
