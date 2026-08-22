@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 
 typedef int AC_STATUS;
 
@@ -55,5 +57,29 @@ struct SPageFilePhysics
 	int pitLimiterOn = 0;
 	float abs = 0;
 };
+
+// Prefix of Assetto Corsa's acpmf_static page.  Only the fields needed by the
+// haptic bridge are declared; the real mapping continues after tyreRadius.
+struct SPageFileStatic
+{
+	wchar_t smVersion[15];
+	wchar_t acVersion[15];
+	int numberOfSessions = 0;
+	int numCars = 0;
+	wchar_t carModel[33];
+	wchar_t track[33];
+	wchar_t playerName[33];
+	wchar_t playerSurname[33];
+	wchar_t playerNick[33];
+	int sectorCount = 0;
+	float maxTorque = 0;
+	float maxPower = 0;
+	int maxRpm = 0;
+	float maxFuel = 0;
+	float suspensionMaxTravel[4];
+	float tyreRadius[4];
+};
+
+static_assert(offsetof(SPageFileStatic, suspensionMaxTravel) == 420, "Unexpected acpmf_static layout");
 
 #pragma pack(pop)

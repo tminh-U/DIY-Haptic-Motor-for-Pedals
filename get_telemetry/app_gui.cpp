@@ -1,5 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
+#include <tlhelp32.h>
 #include <commctrl.h>
 #include <uxtheme.h>
 #include <dwmapi.h>
@@ -9,9 +11,15 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstdio>
-#include "structed_file.h"
+#include <cstring>
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+#include "structed_file_AC.h"
+#include "structed_file_ACC.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -33,28 +41,157 @@ using namespace std;
 
 const int HZ = 60;
 const auto DURATION = chrono::microseconds(1000000 / HZ);
+const char* PYTHON_SHARED_MEMORY_NAME = "haptic_telemetry_v1";
+const float DEFAULT_ABS_SLIP_RATIO = 0.10f;
+const float DEFAULT_SUSPENSION_MAX_TRAVEL = 0.10f;
 
-HANDLE hSerial = INVALID_HANDLE_VALUE;
+enum class GameKind : int {
+    None = 0,
+    AC = 1,
+    ACC = 2
+};
 
-bool initSerial(const char* portName) {
-    hSerial = CreateFileA(portName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-    if (hSerial == INVALID_HANDLE_VALUE) {
-        return false;
+GameKind detectRunningGame() {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return GameKind::None;
+
+    bool acRunning = false;
+    bool accRunning = false;
+    PROCESSENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            const wchar_t* name = entry.szExeFile;
+            if (_wcsicmp(name, L"AC2-Win64-Shipping.exe") == 0 || _wcsicmp(name, L"acc.exe") == 0) {
+                accRunning = true;
+            } else if (_wcsicmp(name, L"acs.exe") == 0 || _wcsicmp(name, L"acs_x86.exe") == 0) {
+                acRunning = true;
+            }
+        } while (Process32NextW(snapshot, &entry));
     }
+    CloseHandle(snapshot);
 
+    // ACC gets priority if both executables happen to overlap during startup.
+    if (accRunning) return GameKind::ACC;
+    if (acRunning) return GameKind::AC;
+    return GameKind::None;
+}
+
+std::atomic<HANDLE> hSerial{INVALID_HANDLE_VALUE};
+std::atomic<bool> g_pauseSerialWrites{false};
+const char* HAPTIC_HANDSHAKE_REQUEST = "ID?\n";
+const char* HAPTIC_HANDSHAKE_PREFIX = "HAPTIC_PEDAL,1,";
+
+std::vector<std::string> getAvailableCOMPorts();
+
+bool configureSerial(HANDLE serial) {
     DCB dcbSerialParams = { 0 };
     dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
-    GetCommState(hSerial, &dcbSerialParams);
+    if (!GetCommState(serial, &dcbSerialParams)) {
+        return false;
+    }
     dcbSerialParams.BaudRate = CBR_115200;
     dcbSerialParams.ByteSize = 8;
     dcbSerialParams.StopBits = ONESTOPBIT;
     dcbSerialParams.Parity   = NOPARITY;
-    SetCommState(hSerial, &dcbSerialParams);
+    dcbSerialParams.fDtrControl = DTR_CONTROL_DISABLE; // Don't reset ESP32 on connect
+    dcbSerialParams.fRtsControl = RTS_CONTROL_DISABLE;
+    if (!SetCommState(serial, &dcbSerialParams)) {
+        return false;
+    }
 
     COMMTIMEOUTS timeouts = { 0 };
+    timeouts.ReadIntervalTimeout = 10;
+    timeouts.ReadTotalTimeoutConstant = 50;
+    timeouts.ReadTotalTimeoutMultiplier = 0;
     timeouts.WriteTotalTimeoutConstant = 5;
-    SetCommTimeouts(hSerial, &timeouts);
+    if (!SetCommTimeouts(serial, &timeouts)) {
+        return false;
+    }
     return true;
+}
+
+bool readHapticIdentity(HANDLE serial, char* deviceId, size_t deviceIdSize) {
+    DWORD bytesWritten = 0;
+    if (!WriteFile(serial, HAPTIC_HANDSHAKE_REQUEST,
+            static_cast<DWORD>(strlen(HAPTIC_HANDSHAKE_REQUEST)), &bytesWritten, NULL)
+        || bytesWritten != strlen(HAPTIC_HANDSHAKE_REQUEST)) {
+        return false;
+    }
+
+    char received[160] = {};
+    size_t receivedLength = 0;
+    DWORD deadline = GetTickCount() + 700;
+    while (static_cast<LONG>(GetTickCount() - deadline) < 0) {
+        char chunk[64];
+        DWORD bytesRead = 0;
+        if (ReadFile(serial, chunk, sizeof(chunk), &bytesRead, NULL) && bytesRead > 0) {
+            size_t toCopy = std::min<size_t>(bytesRead, sizeof(received) - receivedLength - 1);
+            memcpy(received + receivedLength, chunk, toCopy);
+            receivedLength += toCopy;
+            received[receivedLength] = '\0';
+
+            const char* identity = strstr(received, HAPTIC_HANDSHAKE_PREFIX);
+            if (identity) {
+                identity += strlen(HAPTIC_HANDSHAKE_PREFIX);
+                size_t idLength = strcspn(identity, "\r\n");
+                if (idLength > 0 && idLength < deviceIdSize) {
+                    memcpy(deviceId, identity, idLength);
+                    deviceId[idLength] = '\0';
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+bool tryOpenHapticPort(const std::string& portName, HANDLE& outSerial, char* deviceId, size_t deviceIdSize) {
+    std::string fullPort = "\\\\.\\" + portName;
+    HANDLE serial = CreateFileA(fullPort.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (serial == INVALID_HANDLE_VALUE) return false;
+
+    if (!configureSerial(serial)) {
+        CloseHandle(serial);
+        return false;
+    }
+
+    // Some USB-UART bridges can still reset the ESP32 while the port opens.
+    // Wait for its Core 0 UART task before asking for the identity.
+    Sleep(1800);
+    if (!PurgeComm(serial, PURGE_RXCLEAR | PURGE_TXCLEAR)) {
+        CloseHandle(serial);
+        return false;
+    }
+
+    if (!readHapticIdentity(serial, deviceId, deviceIdSize)) {
+        CloseHandle(serial);
+        return false;
+    }
+    outSerial = serial;
+    return true;
+}
+
+bool initSerialAuto(char* portName, size_t portNameSize, char* deviceId, size_t deviceIdSize) {
+    for (const std::string& candidate : getAvailableCOMPorts()) {
+        HANDLE serial = INVALID_HANDLE_VALUE;
+        char foundDeviceId[32] = {};
+        if (!tryOpenHapticPort(candidate, serial, foundDeviceId, sizeof(foundDeviceId))) continue;
+
+        strncpy_s(portName, portNameSize, candidate.c_str(), _TRUNCATE);
+        strncpy_s(deviceId, deviceIdSize, foundDeviceId, _TRUNCATE);
+        hSerial.store(serial, std::memory_order_release);
+        return true;
+    }
+    return false;
+}
+
+void closeSerial() {
+    HANDLE serial = hSerial.exchange(INVALID_HANDLE_VALUE, std::memory_order_acq_rel);
+    if (serial != INVALID_HANDLE_VALUE) {
+        CloseHandle(serial);
+    }
 }
 
 struct SMElement {
@@ -63,28 +200,234 @@ struct SMElement {
 };
 
 SMElement m_physics;
+SMElement m_static;
+SMElement m_pythonTelemetry;
 
 // clean
-void dismiss(SMElement element) {
-    UnmapViewOfFile(element.mapFileBuffer);
-    CloseHandle(element.hMapFile);
+void dismiss(SMElement& element) {
+    if (element.mapFileBuffer) {
+        UnmapViewOfFile(element.mapFileBuffer);
+        element.mapFileBuffer = nullptr;
+    }
+    if (element.hMapFile) {
+        CloseHandle(element.hMapFile);
+        element.hMapFile = nullptr;
+    }
 }
 
 // get data from shared memory (open only, do not create)
-bool initPhysics() {
+bool initPhysics(GameKind game) {
+    if (m_physics.mapFileBuffer != nullptr) return true; // Already initialized
+
     m_physics.hMapFile = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\acpmf_physics");
     if (!m_physics.hMapFile) return false;
-    m_physics.mapFileBuffer = (unsigned char*)MapViewOfFile(m_physics.hMapFile, FILE_MAP_READ, 0, 0, sizeof(SPageFilePhysics));
-    if (!m_physics.mapFileBuffer) return false;
+    
+    size_t mapSize = (game == GameKind::ACC) ? sizeof(acc::SPageFilePhysics) : sizeof(SPageFilePhysics);
+    m_physics.mapFileBuffer = (unsigned char*)MapViewOfFile(m_physics.hMapFile, FILE_MAP_READ, 0, 0, mapSize);
+    if (!m_physics.mapFileBuffer) {
+        CloseHandle(m_physics.hMapFile);
+        m_physics.hMapFile = nullptr;
+        return false;
+    }
     return true;
 }
 
-void sendDataToESP32(float absActive, float wheelSlipL, float wheelSlipR, float SusL, float SusR) {
-    if (hSerial == INVALID_HANDLE_VALUE) return;
+bool initStatic(GameKind game) {
+    if (m_static.mapFileBuffer != nullptr) return true;
+
+    m_static.hMapFile = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\acpmf_static");
+    if (!m_static.hMapFile) return false;
+
+    size_t mapSize = (game == GameKind::ACC) ? sizeof(acc::SPageFileStatic) : sizeof(SPageFileStatic);
+    m_static.mapFileBuffer = static_cast<unsigned char*>(MapViewOfFile(
+        m_static.hMapFile, FILE_MAP_READ, 0, 0, mapSize));
+    if (!m_static.mapFileBuffer) {
+        CloseHandle(m_static.hMapFile);
+        m_static.hMapFile = nullptr;
+        return false;
+    }
+    return true;
+}
+
+bool initPythonTelemetry() {
+    if (m_pythonTelemetry.mapFileBuffer != nullptr) return true;
+
+    m_pythonTelemetry.hMapFile = OpenFileMappingA(
+        FILE_MAP_READ,
+        FALSE,
+        PYTHON_SHARED_MEMORY_NAME
+    );
+    if (!m_pythonTelemetry.hMapFile) return false;
+
+    m_pythonTelemetry.mapFileBuffer = static_cast<unsigned char*>(MapViewOfFile(
+        m_pythonTelemetry.hMapFile,
+        FILE_MAP_READ,
+        0,
+        0,
+        44
+    ));
+    if (!m_pythonTelemetry.mapFileBuffer) {
+        CloseHandle(m_pythonTelemetry.hMapFile);
+        m_pythonTelemetry.hMapFile = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void sendDataToESP32(float absActive, float slipRatioL, float slipRatioR, float roadL, float roadR) {
+    if (g_pauseSerialWrites.load(std::memory_order_acquire)) return;
+    HANDLE serial = hSerial.load(std::memory_order_acquire);
+    if (serial == INVALID_HANDLE_VALUE) return;
     char buffer[64];
-    int len = sprintf_s(buffer, "%.2f,%.4f,%.4f,%.4f,%.4f\n", absActive, wheelSlipL, wheelSlipR, SusL, SusR);
+    int len = sprintf_s(buffer, "%.2f,%.4f,%.4f,%.4f,%.4f\n", absActive, slipRatioL, slipRatioR, roadL, roadR);
     DWORD bytesWritten;
-    WriteFile(hSerial, buffer, len, &bytesWritten, NULL);
+    WriteFile(serial, buffer, len, &bytesWritten, NULL);
+}
+
+float suspensionMaxTravel(GameKind game, int wheelIndex) {
+    if (!m_static.mapFileBuffer || wheelIndex < 0 || wheelIndex >= 4) {
+        return DEFAULT_SUSPENSION_MAX_TRAVEL;
+    }
+
+    float value = (game == GameKind::ACC)
+        ? reinterpret_cast<acc::SPageFileStatic*>(m_static.mapFileBuffer)->suspensionMaxTravel[wheelIndex]
+        : reinterpret_cast<SPageFileStatic*>(m_static.mapFileBuffer)->suspensionMaxTravel[wheelIndex];
+    return (std::isfinite(value) && value >= 0.01f && value <= 1.0f)
+        ? value
+        : DEFAULT_SUSPENSION_MAX_TRAVEL;
+}
+
+float calculateRoadIntensity(float currentTravel, float previousTravel, float maxTravel, float deltaTimeSeconds) {
+    if (!std::isfinite(currentTravel) || !std::isfinite(previousTravel)
+        || !std::isfinite(maxTravel) || !std::isfinite(deltaTimeSeconds)
+        || maxTravel <= 0.0f || deltaTimeSeconds <= 0.0f) {
+        return 0.0f;
+    }
+
+    // Normalized suspension velocity.  A value of 1 means the wheel moved by
+    // one full suspension travel per second; larger impacts are saturated.
+    float normalizedRate = std::fabs(currentTravel - previousTravel)
+        / (maxTravel * deltaTimeSeconds);
+    return std::clamp(normalizedRate, 0.0f, 1.0f);
+}
+
+struct NormalizedTelemetry {
+    uint32_t sequence = 0;
+    float brake = 0.0f;
+    float speedKmh = 0.0f;
+    float slipRatioFL = 0.0f;
+    float slipRatioFR = 0.0f;
+    float ndSlipFL = 0.0f;
+    float ndSlipFR = 0.0f;
+    float suspensionFL = 0.0f;
+    float suspensionFR = 0.0f;
+    bool nativeAbsValid = false;
+    bool nativeAbsActive = false;
+};
+
+bool validateTelemetry(const NormalizedTelemetry& parsed) {
+    if (!std::isfinite(parsed.brake) || !std::isfinite(parsed.speedKmh)
+        || !std::isfinite(parsed.slipRatioFL) || !std::isfinite(parsed.slipRatioFR)
+        || !std::isfinite(parsed.ndSlipFL) || !std::isfinite(parsed.ndSlipFR)
+        || !std::isfinite(parsed.suspensionFL) || !std::isfinite(parsed.suspensionFR)) {
+        return false;
+    }
+
+    if (parsed.brake < -0.01f || parsed.brake > 1.01f
+        || parsed.speedKmh < -5.0f || parsed.speedKmh > 1000.0f
+        || std::fabs(parsed.slipRatioFL) > 10.0f || std::fabs(parsed.slipRatioFR) > 10.0f
+        || std::fabs(parsed.ndSlipFL) > 100.0f || std::fabs(parsed.ndSlipFR) > 100.0f
+        || std::fabs(parsed.suspensionFL) > 2.0f || std::fabs(parsed.suspensionFR) > 2.0f) {
+        return false;
+    }
+
+    return true;
+}
+
+#pragma pack(push, 1)
+struct PythonTelemetryShared {
+    char magic[4];
+    uint32_t sequenceStart;
+    float brake;
+    float speedKmh;
+    float slipRatioFL;
+    float slipRatioFR;
+    float ndSlipFL;
+    float ndSlipFR;
+    float suspensionFL;
+    float suspensionFR;
+    uint32_t sequenceEnd;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(PythonTelemetryShared) == 44, "Unexpected Python telemetry layout");
+
+bool readPythonTelemetry(NormalizedTelemetry& out) {
+    if (!m_pythonTelemetry.mapFileBuffer) return false;
+
+    volatile PythonTelemetryShared* shared =
+        reinterpret_cast<volatile PythonTelemetryShared*>(m_pythonTelemetry.mapFileBuffer);
+
+    if (shared->magic[0] != 'H' || shared->magic[1] != 'P'
+        || shared->magic[2] != 'T' || shared->magic[3] != '1') {
+        return false;
+    }
+
+    uint32_t sequenceBefore = shared->sequenceStart;
+    MemoryBarrier();
+    if ((sequenceBefore & 1U) != 0U || sequenceBefore == 0U) return false;
+
+    NormalizedTelemetry parsed;
+    parsed.sequence = sequenceBefore;
+    parsed.brake = shared->brake;
+    parsed.speedKmh = shared->speedKmh;
+    parsed.slipRatioFL = shared->slipRatioFL;
+    parsed.slipRatioFR = shared->slipRatioFR;
+    parsed.ndSlipFL = shared->ndSlipFL;
+    parsed.ndSlipFR = shared->ndSlipFR;
+    parsed.suspensionFL = shared->suspensionFL;
+    parsed.suspensionFR = shared->suspensionFR;
+
+    MemoryBarrier();
+    uint32_t sequenceEnd = shared->sequenceEnd;
+    uint32_t sequenceAfter = shared->sequenceStart;
+    if (sequenceBefore != sequenceEnd || sequenceBefore != sequenceAfter) return false;
+    if (!validateTelemetry(parsed)) return false;
+
+    out = parsed;
+    return true;
+}
+
+bool readAccTelemetry(NormalizedTelemetry& out) {
+    if (!m_physics.mapFileBuffer) return false;
+
+    volatile acc::SPageFilePhysics* shared =
+        reinterpret_cast<volatile acc::SPageFilePhysics*>(m_physics.mapFileBuffer);
+
+    int packetBefore = shared->packetId;
+    MemoryBarrier();
+
+    NormalizedTelemetry parsed;
+    parsed.sequence = static_cast<uint32_t>(packetBefore);
+    parsed.brake = shared->brake;
+    parsed.speedKmh = shared->speedKmh;
+    parsed.slipRatioFL = shared->slipRatio[0];
+    parsed.slipRatioFR = shared->slipRatio[1];
+    parsed.suspensionFL = shared->suspensionTravel[0];
+    parsed.suspensionFR = shared->suspensionTravel[1];
+    int absInAction = shared->absInAction;
+
+    MemoryBarrier();
+    int packetAfter = shared->packetId;
+    if (packetBefore != packetAfter || packetBefore <= 0) return false;
+    if (absInAction != 0 && absInAction != 1) return false;
+
+    parsed.nativeAbsValid = true;
+    parsed.nativeAbsActive = (absInAction == 1);
+    if (!validateTelemetry(parsed)) return false;
+
+    out = parsed;
+    return true;
 }
 
 // ==============================================================================
@@ -105,6 +448,7 @@ void sendDataToESP32(float absActive, float wheelSlipL, float wheelSlipR, float 
 #define IDC_LBL_SLIP_VAL    1011
 #define IDC_LBL_SUS_VAL     1012
 #define IDC_LBL_FPS         1013
+#define IDC_LBL_PANIC_STAT  1014
 
 HINSTANCE hInst;
 HWND hWndMain;
@@ -113,22 +457,32 @@ HWND hLblSerialStat, hLblGameStat, hLblFPS;
 HWND hPrgBrake, hLblBrakeVal, hLblAbsStat;
 HWND hPrgSlipL, hPrgSlipR, hLblSlipVal, hLblSusVal;
 HWND hLblRawBrake, hLblRawSlipL, hLblRawSlipR, hLblRawSusL, hLblRawSusR, hLblRawAbs;
+HWND hLblPanicStat;
 
 HBRUSH hBrushBg;
 HBRUSH hBrushCard;
 HBRUSH hBrushBtnDark;
 HBRUSH hBrushActiveAbs;
 HBRUSH hBrushInactiveAbs;
+HBRUSH hBrushPanicBg;
 HFONT hFontRegular, hFontBold, hFontTitle, hFontStatus;
 
 std::atomic<bool> isRunning(false);
 std::atomic<bool> isConnected(false);
 std::thread workerThread;
+std::thread serialMonitorThread;
+
+// ESP32 panic detection via serial read
+std::atomic<bool> g_esp32Panicked{false};
+std::atomic<bool> g_panicMsgBoxShown{false};
+std::mutex g_panicMutex;
+char g_panicMessage[2048] = {0};
 
 // Worker -> GUI thread communication via atomics (no cross-thread GUI calls)
-// 0 = idle, 1 = connected, 2 = failed, 3 = disconnected
+// 0 = idle, 1 = connected, 2 = serial error, 3 = disconnected, 4 = no matching haptic device
 std::atomic<int> g_serialStatus{0};
 char g_serialPortName[32] = {0};
+char g_hapticDeviceId[32] = {0};
 
 // Live Telemetry Cache for GUI rendering
 struct LiveData {
@@ -138,13 +492,14 @@ struct LiveData {
     std::atomic<float> slipR{0.0f};
     std::atomic<float> susL{0.0f};
     std::atomic<float> susR{0.0f};
-    std::atomic<int>   acState{0}; // 0 = Closed, 1 = Menu, 2 = Driving
+    std::atomic<float> ndSlipL{0.0f};
+    std::atomic<float> ndSlipR{0.0f};
+    std::atomic<int>   gameKind{0}; // GameKind value
+    std::atomic<int>   acState{0};  // 0 = closed, 1 = game found/waiting, 2 = telemetry active
     std::atomic<int>   fps{0};
-    std::atomic<bool>  absActive{false}; // ABS detected via wheelSlip + brake
+    std::atomic<bool>  absActive{false}; // ABS detected via longitudinal SlipRatio + brake
 } g_live;
 
-int g_lastCheckPacketId = -1;
-int g_idleAcCount = 0;
 int g_prevSerialStatus = -1; // Track previous status to avoid redundant GUI updates
 
 // Enumerate available COM ports from Windows Registry
@@ -191,109 +546,269 @@ void refreshPortList() {
     }
 }
 
-// Background Worker Thread (Telemetry polling & serial transmission)
-// All GUI updates are done via atomic variables, read by WM_TIMER on the GUI thread.
-void telemetryWorker(std::string com) {
-    string fullPort = "\\\\.\\" + com;
-    if (!initSerial(fullPort.c_str())) {
+// Serial Monitor Thread: reads lines from ESP32 and detects fatal panics
+void serialMonitorWorker() {
+    char readBuf[512];
+    char lineBuf[512];
+    int linePos = 0;
+    bool isCapturing = false;
+    int captureLines = 0;
+
+    while (isRunning) {
+        HANDLE serial = hSerial.load(std::memory_order_acquire);
+        if (serial == INVALID_HANDLE_VALUE) {
+            std::this_thread::sleep_for(chrono::milliseconds(100));
+            continue;
+        }
+
+        DWORD bytesRead = 0;
+        if (ReadFile(serial, readBuf, sizeof(readBuf) - 1, &bytesRead, NULL) && bytesRead > 0) {
+            for (DWORD i = 0; i < bytesRead; i++) {
+                char c = readBuf[i];
+                if (c == '\n' || c == '\r') {
+                    if (linePos > 0) {
+                        lineBuf[linePos] = '\0';
+                        // Check for ESP32 fatal panic keywords
+                        if (!isCapturing) {
+                            if (strstr(lineBuf, "Guru Meditation") || strstr(lineBuf, "panic") ||
+                                strstr(lineBuf, "abort()") || strstr(lineBuf, "LoadProhibited") ||
+                                strstr(lineBuf, "StoreProhibited") || strstr(lineBuf, "InstrFetchProhibited")) {
+                                std::lock_guard<std::mutex> lock(g_panicMutex);
+                                strncpy(g_panicMessage, lineBuf, sizeof(g_panicMessage) - 1);
+                                g_panicMessage[sizeof(g_panicMessage) - 1] = '\0';
+                                g_pauseSerialWrites.store(true, std::memory_order_release);
+                                g_esp32Panicked = true;
+                                isCapturing = true;
+                                captureLines = 0;
+                            }
+                        } else {
+                            if (captureLines < 20) {
+                                std::lock_guard<std::mutex> lock(g_panicMutex);
+                                strncat(g_panicMessage, "\n", sizeof(g_panicMessage) - strlen(g_panicMessage) - 1);
+                                strncat(g_panicMessage, lineBuf, sizeof(g_panicMessage) - strlen(g_panicMessage) - 1);
+                                captureLines++;
+                            }
+                        }
+                        linePos = 0;
+                    }
+                } else if (c >= 32 && c <= 126 && linePos < (int)sizeof(lineBuf) - 1) {
+                    lineBuf[linePos++] = c;
+                }
+            }
+        } else {
+            // No data available, small sleep to avoid busy-wait
+            std::this_thread::sleep_for(chrono::milliseconds(10));
+        }
+    }
+}
+
+void clearLiveTelemetry() {
+    g_live.brake = 0.0f;
+    g_live.absVal = 0.0f;
+    g_live.slipL = 0.0f;
+    g_live.slipR = 0.0f;
+    g_live.susL = 0.0f;
+    g_live.susR = 0.0f;
+    g_live.ndSlipL = 0.0f;
+    g_live.ndSlipR = 0.0f;
+    g_live.absActive = false;
+}
+
+// AC uses the in-game Python bridge for physical SlipRatio. ACC publishes
+// SlipRatio and absInAction directly in its extended shared-memory physics page.
+// Both sources are normalized into the same five-field ESP32 packet.
+void telemetryWorker() {
+    if (!initSerialAuto(g_serialPortName, sizeof(g_serialPortName), g_hapticDeviceId, sizeof(g_hapticDeviceId))) {
         isConnected = false;
         isRunning = false;
-        g_serialStatus = 2; // Signal: failed
+        g_serialStatus = 4;
         return;
     }
 
     isConnected = true;
-    g_serialStatus = 1; // Signal: connected
+    g_serialStatus = 1;
 
-    int frameCount = 0;
-    auto lastFpsTime = std::chrono::steady_clock::now();
+    GameKind activeGame = GameKind::None;
+    NormalizedTelemetry latest;
+    auto lastPacketTime = chrono::steady_clock::now() - chrono::seconds(10);
+    auto nextGameProbe = chrono::steady_clock::now();
+    auto nextPhysicsRetry = chrono::steady_clock::now();
+    auto nextStaticRetry = chrono::steady_clock::now();
+    auto nextPythonRetry = chrono::steady_clock::now();
+    auto nextFrame = chrono::steady_clock::now();
+    auto lastFpsTime = chrono::steady_clock::now();
+    int packetCount = 0;
+    bool absLatched = false;
+    bool suspensionBaselineValid = false;
+    float previousSuspensionFL = 0.0f;
+    float previousSuspensionFR = 0.0f;
+    float roadIntensityFL = 0.0f;
+    float roadIntensityFR = 0.0f;
+    auto previousSuspensionTime = chrono::steady_clock::now();
 
     while (isRunning) {
-        if (!initPhysics()) {
-            g_live.acState = 0;
-            std::this_thread::sleep_for(chrono::milliseconds(500));
-            continue;
+        nextFrame += DURATION;
+        auto now = chrono::steady_clock::now();
+
+        if (now >= nextGameProbe) {
+            GameKind detectedGame = detectRunningGame();
+            if (detectedGame != activeGame) {
+                dismiss(m_pythonTelemetry);
+                dismiss(m_static);
+                dismiss(m_physics);
+                activeGame = detectedGame;
+                latest = NormalizedTelemetry{};
+                lastPacketTime = now - chrono::seconds(10);
+                absLatched = false;
+                suspensionBaselineValid = false;
+                roadIntensityFL = 0.0f;
+                roadIntensityFR = 0.0f;
+                clearLiveTelemetry();
+                g_live.gameKind = static_cast<int>(activeGame);
+            }
+            nextGameProbe = now + chrono::milliseconds(500);
         }
 
-        SPageFilePhysics* pf = (SPageFilePhysics*)m_physics.mapFileBuffer;
-        auto next_frame = chrono::steady_clock::now();
-        int lstid = pf->packetId, cnt = 0;
-        bool isFresh = false; // Track if we've seen a new packet since connecting
+        if (activeGame != GameKind::None) {
+            if (!m_physics.mapFileBuffer && now >= nextPhysicsRetry) {
+                initPhysics(activeGame);
+                nextPhysicsRetry = now + chrono::seconds(1);
+            }
+            if (!m_static.mapFileBuffer && now >= nextStaticRetry) {
+                initStatic(activeGame);
+                nextStaticRetry = now + chrono::seconds(1);
+            }
+            if (activeGame == GameKind::AC
+                && !m_pythonTelemetry.mapFileBuffer && now >= nextPythonRetry) {
+                initPythonTelemetry();
+                nextPythonRetry = now + chrono::seconds(1);
+            }
+        }
 
-        while (isRunning) {
-            next_frame += DURATION;
-
-            if (pf->packetId == lstid) {
-                ++cnt;
-                if (cnt > 240) {
-                    g_live.acState = 1; // In Menu / Paused
-                    sendDataToESP32(0, 0, 0, 0, 0);
-                    break;
+        NormalizedTelemetry candidate;
+        bool packetRead = (activeGame == GameKind::AC)
+            ? readPythonTelemetry(candidate)
+            : (activeGame == GameKind::ACC && readAccTelemetry(candidate));
+        if (packetRead && candidate.sequence != latest.sequence) {
+            if (suspensionBaselineValid) {
+                float deltaTime = chrono::duration<float>(now - previousSuspensionTime).count();
+                // Reject session changes and long stalls instead of turning them
+                // into a false full-strength kerb hit.
+                if (deltaTime >= 0.005f && deltaTime <= 0.10f) {
+                    roadIntensityFL = calculateRoadIntensity(
+                        candidate.suspensionFL,
+                        previousSuspensionFL,
+                        suspensionMaxTravel(activeGame, 0),
+                        deltaTime
+                    );
+                    roadIntensityFR = calculateRoadIntensity(
+                        candidate.suspensionFR,
+                        previousSuspensionFR,
+                        suspensionMaxTravel(activeGame, 1),
+                        deltaTime
+                    );
+                } else {
+                    roadIntensityFL = 0.0f;
+                    roadIntensityFR = 0.0f;
                 }
             } else {
-                cnt = 0;
-                lstid = pf->packetId;
-                isFresh = true;
-                g_live.acState = 2; // Active Driving
+                suspensionBaselineValid = true;
+                roadIntensityFL = 0.0f;
+                roadIntensityFR = 0.0f;
             }
-
-            if (!isFresh || cnt > 20) {
-                // Game paused (no updates for >166ms) or just connected
-                sendDataToESP32(0, 0, 0, 0, 0);
-                g_live.brake = 0; g_live.absVal = 0;
-                g_live.slipL = 0; g_live.slipR = 0;
-                g_live.susL = 0;  g_live.susR = 0;
-                g_live.absActive = false;
-            } else {
-                // Read telemetry values
-                float speedKmh = pf->speedKmh;
-                float absVal   = pf->abs;
-                float brakeVal = pf->brake;
-                // Force slip to 0 if speed < 3 km/h to eliminate physics noise at a standstill
-                float slipValL = (speedKmh > 3.0f) ? pf->wheelSlip[0] : 0.0f; 
-                float slipValR = (speedKmh > 3.0f) ? pf->wheelSlip[1] : 0.0f; 
-                float SusL     = pf->suspensionTravel[0]; // FL suspension
-                float SusR     = pf->suspensionTravel[1]; // FR suspension
-
-                // Detect ABS activation via wheelSlip + brake + ABS setting
-                bool absDetected = ((brakeVal > 0.05f) && (max(slipValL, slipValR) >= 0.8f) && (absVal > 0.0f));
-
-                // Cache live telemetry for GUI updates
-                g_live.brake = brakeVal;
-                g_live.absVal = absVal;
-                g_live.slipL = slipValL;
-                g_live.slipR = slipValR;
-                g_live.susL = SusL;
-                g_live.susR = SusR;
-                g_live.absActive = absDetected;
-
-                // Send packet to ESP32 (absDetected instead of unreliable pf->abs)
-                sendDataToESP32(absDetected ? 1.0f : 0.0f, slipValL, slipValR, SusL, SusR);
-            }
-
-            // Measure actual streaming frame rate
-            frameCount++;
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFpsTime).count() >= 1000) {
-                g_live.fps = frameCount;
-                frameCount = 0;
-                lastFpsTime = now;
-            }
-
-            this_thread::sleep_until(next_frame);
+            previousSuspensionFL = candidate.suspensionFL;
+            previousSuspensionFR = candidate.suspensionFR;
+            previousSuspensionTime = now;
+            latest = candidate;
+            lastPacketTime = now;
+            ++packetCount;
         }
 
-        dismiss(m_physics);
+        bool telemetryFresh = activeGame != GameKind::None
+            && chrono::duration_cast<chrono::milliseconds>(now - lastPacketTime).count() <= 250;
+
+        if (!telemetryFresh) {
+            g_live.acState = (activeGame != GameKind::None) ? 1 : 0;
+            absLatched = false;
+            suspensionBaselineValid = false;
+            roadIntensityFL = 0.0f;
+            roadIntensityFR = 0.0f;
+            clearLiveTelemetry();
+            sendDataToESP32(0, 0, 0, 0, 0);
+        } else {
+            g_live.acState = 2;
+
+            float slipL = std::min(std::fabs(latest.slipRatioFL), 2.0f);
+            float slipR = std::min(std::fabs(latest.slipRatioFR), 2.0f);
+            float maxFrontSlip = std::max(slipL, slipR);
+            bool brakeGate = latest.brake > 0.05f && latest.speedKmh > 3.0f;
+            float absConfig = 0.0f;
+
+            if (activeGame == GameKind::ACC) {
+                // ACC exposes the real intervention flag; no inferred ABS
+                // threshold is needed for this game.
+                absConfig = latest.nativeAbsActive ? 1.0f : 0.0f;
+                absLatched = brakeGate && latest.nativeAbsValid && latest.nativeAbsActive;
+            } else {
+                SPageFilePhysics* pf = reinterpret_cast<SPageFilePhysics*>(m_physics.mapFileBuffer);
+                absConfig = pf ? pf->abs : 0.0f;
+                bool absEnabled = absConfig > 0.001f;
+                float absThreshold = (absConfig >= 0.03f && absConfig <= 0.30f)
+                    ? absConfig
+                    : DEFAULT_ABS_SLIP_RATIO;
+
+                if (!brakeGate || !absEnabled) {
+                    absLatched = false;
+                } else if (!absLatched && maxFrontSlip >= absThreshold) {
+                    absLatched = true;
+                } else if (absLatched && maxFrontSlip < absThreshold * 0.70f) {
+                    absLatched = false;
+                }
+            }
+
+            // A brake-pedal exciter should not react to lateral drift. Only the
+            // longitudinal front-wheel ratios pass through while braking.
+            float brakeSlipL = brakeGate ? slipL : 0.0f;
+            float brakeSlipR = brakeGate ? slipR : 0.0f;
+
+            g_live.brake = latest.brake;
+            g_live.absVal = absConfig;
+            g_live.slipL = brakeSlipL;
+            g_live.slipR = brakeSlipR;
+            g_live.ndSlipL = latest.ndSlipFL;
+            g_live.ndSlipR = latest.ndSlipFR;
+            g_live.susL = roadIntensityFL;
+            g_live.susR = roadIntensityFR;
+            g_live.absActive = absLatched;
+
+            sendDataToESP32(
+                absLatched ? 1.0f : 0.0f,
+                brakeSlipL,
+                brakeSlipR,
+                roadIntensityFL,
+                roadIntensityFR
+            );
+        }
+
+        if (chrono::duration_cast<chrono::milliseconds>(now - lastFpsTime).count() >= 1000) {
+            g_live.fps = packetCount;
+            packetCount = 0;
+            lastFpsTime = now;
+        }
+
+        this_thread::sleep_until(nextFrame);
     }
 
-    // Cleanup serial
-    if (hSerial != INVALID_HANDLE_VALUE) {
-        CloseHandle(hSerial);
-        hSerial = INVALID_HANDLE_VALUE;
-    }
+    sendDataToESP32(0, 0, 0, 0, 0);
+    dismiss(m_pythonTelemetry);
+    dismiss(m_static);
+    dismiss(m_physics);
+    clearLiveTelemetry();
     isConnected = false;
+    g_live.gameKind = 0;
+    g_live.acState = 0;
     g_live.fps = 0;
-    g_serialStatus = 3; // Signal: disconnected
+    g_serialStatus = 3;
 }
 
 // Window Procedure
@@ -319,12 +834,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             hBrushBtnDark     = CreateSolidBrush(RGB(42, 42, 50));    // #2A2A32
             hBrushActiveAbs   = CreateSolidBrush(RGB(255, 23, 68));   // #FF1744
             hBrushInactiveAbs = CreateSolidBrush(RGB(30, 30, 36));   // #1E1E24
+            hBrushPanicBg     = CreateSolidBrush(RGB(180, 0, 0));    // Dark Red for panic
 
             // --- Card 1: Connection Settings ---
             HWND hTitle1 = CreateWindowA("STATIC", "  ESP32 + Simulator Connection", WS_CHILD | WS_VISIBLE, 20, 14, 460, 22, hWnd, NULL, hInst, NULL);
             SendMessage(hTitle1, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
 
-            HWND hLblCom = CreateWindowA("STATIC", "COM Port:", WS_CHILD | WS_VISIBLE, 32, 48, 75, 20, hWnd, NULL, hInst, NULL);
+            HWND hLblCom = CreateWindowA("STATIC", "Auto scan:", WS_CHILD | WS_VISIBLE, 32, 48, 75, 20, hWnd, NULL, hInst, NULL);
             SendMessage(hLblCom, WM_SETFONT, (WPARAM)hFontBold, TRUE);
 
             hComboPorts = CreateWindowA("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 115, 45, 115, 150, hWnd, (HMENU)IDC_COMBO_PORTS, hInst, NULL);
@@ -336,14 +852,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             hLblSerialStat = CreateWindowA("STATIC", "ESP32: [DISCONNECTED]", WS_CHILD | WS_VISIBLE, 32, 84, 420, 20, hWnd, (HMENU)IDC_LBL_SERIAL_STAT, hInst, NULL);
             SendMessage(hLblSerialStat, WM_SETFONT, (WPARAM)hFontStatus, TRUE);
 
-            hLblGameStat   = CreateWindowA("STATIC", "Assetto Corsa: [CHECKING...]", WS_CHILD | WS_VISIBLE, 32, 108, 290, 20, hWnd, (HMENU)IDC_LBL_GAME_STAT, hInst, NULL);
+            hLblGameStat   = CreateWindowA("STATIC", "AC / ACC: [CHECKING...]", WS_CHILD | WS_VISIBLE, 32, 108, 290, 20, hWnd, (HMENU)IDC_LBL_GAME_STAT, hInst, NULL);
             SendMessage(hLblGameStat, WM_SETFONT, (WPARAM)hFontStatus, TRUE);
 
             hLblFPS        = CreateWindowA("STATIC", "Stream: 0 Hz", WS_CHILD | WS_VISIBLE | SS_RIGHT, 330, 108, 135, 20, hWnd, (HMENU)IDC_LBL_FPS, hInst, NULL);
             SendMessage(hLblFPS, WM_SETFONT, (WPARAM)hFontStatus, TRUE);
 
             // --- Card 2: Live Telemetry Dashboard ---
-            HWND hTitle2 = CreateWindowA("STATIC", "  Live Real-time Telemetry (60 Hz)", WS_CHILD | WS_VISIBLE, 20, 150, 460, 22, hWnd, NULL, hInst, NULL);
+            HWND hTitle2 = CreateWindowA("STATIC", "  AC / ACC Telemetry Bridge (60 Hz)", WS_CHILD | WS_VISIBLE, 20, 150, 460, 22, hWnd, NULL, hInst, NULL);
             SendMessage(hTitle2, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
 
             // Brake
@@ -367,7 +883,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(hLblAbsStat, WM_SETFONT, (WPARAM)hFontBold, TRUE);
 
             // Tire Slip
-            HWND hLblSlp = CreateWindowA("STATIC", "Front Slip L/R:", WS_CHILD | WS_VISIBLE, 32, 248, 92, 20, hWnd, NULL, hInst, NULL);
+            HWND hLblSlp = CreateWindowA("STATIC", "Long SlipRatio:", WS_CHILD | WS_VISIBLE, 32, 248, 92, 20, hWnd, NULL, hInst, NULL);
             SendMessage(hLblSlp, WM_SETFONT, (WPARAM)hFontBold, TRUE);
 
             hPrgSlipL = CreateWindowA(PROGRESS_CLASSA, "", WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 125, 248, 125, 16, hWnd, (HMENU)IDC_PRG_SLIP_L, hInst, NULL);
@@ -384,33 +900,40 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             hLblSlipVal = CreateWindowA("STATIC", "0.00 / 0.00", WS_CHILD | WS_VISIBLE | SS_RIGHT, 395, 248, 70, 20, hWnd, (HMENU)IDC_LBL_SLIP_VAL, hInst, NULL);
             SendMessage(hLblSlipVal, WM_SETFONT, (WPARAM)hFontBold, TRUE);
 
-            // Suspension Travel
-            HWND hLblSus = CreateWindowA("STATIC", "Suspension:", WS_CHILD | WS_VISIBLE, 32, 282, 85, 20, hWnd, NULL, hInst, NULL);
+            // Road intensity derived from normalized suspension velocity
+            HWND hLblSus = CreateWindowA("STATIC", "Road effect:", WS_CHILD | WS_VISIBLE, 32, 282, 85, 20, hWnd, NULL, hInst, NULL);
             SendMessage(hLblSus, WM_SETFONT, (WPARAM)hFontBold, TRUE);
 
-            hLblSusVal = CreateWindowA("STATIC", "FL: 0.000m   |   FR: 0.000m", WS_CHILD | WS_VISIBLE, 125, 282, 340, 20, hWnd, (HMENU)IDC_LBL_SUS_VAL, hInst, NULL);
+            hLblSusVal = CreateWindowA("STATIC", "FL: 0.000   |   FR: 0.000", WS_CHILD | WS_VISIBLE, 125, 282, 340, 20, hWnd, (HMENU)IDC_LBL_SUS_VAL, hInst, NULL);
             SendMessage(hLblSusVal, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
 
-            // --- Card 3: Raw Telemetry Data ---
-            HWND hTitle3 = CreateWindowA("STATIC", "  Raw Telemetry Data", WS_CHILD | WS_VISIBLE, 20, 475, 460, 22, hWnd, NULL, hInst, NULL);
+            // --- Card 3: ESP32 Health ---
+            HWND hTitle3 = CreateWindowA("STATIC", "  ESP32 Health Monitor", WS_CHILD | WS_VISIBLE, 20, 325, 460, 22, hWnd, NULL, hInst, NULL);
             SendMessage(hTitle3, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
 
-            hLblRawBrake = CreateWindowA("STATIC", "Brake: 0.0000", WS_CHILD | WS_VISIBLE, 32, 505, 140, 20, hWnd, NULL, hInst, NULL);
+            hLblPanicStat = CreateWindowA("STATIC", "  ESP32 Status: OK", WS_CHILD | WS_VISIBLE, 32, 355, 430, 22, hWnd, (HMENU)IDC_LBL_PANIC_STAT, hInst, NULL);
+            SendMessage(hLblPanicStat, WM_SETFONT, (WPARAM)hFontStatus, TRUE);
+
+            // --- Card 4: Raw Telemetry Data ---
+            HWND hTitle4 = CreateWindowA("STATIC", "  Raw Telemetry Data", WS_CHILD | WS_VISIBLE, 20, 530, 460, 22, hWnd, NULL, hInst, NULL);
+            SendMessage(hTitle4, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
+
+            hLblRawBrake = CreateWindowA("STATIC", "Brake: 0.0000", WS_CHILD | WS_VISIBLE, 32, 560, 140, 20, hWnd, NULL, hInst, NULL);
             SendMessage(hLblRawBrake, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
 
-            hLblRawAbs = CreateWindowA("STATIC", "ABS Set: 0.0000", WS_CHILD | WS_VISIBLE, 180, 505, 140, 20, hWnd, NULL, hInst, NULL);
+            hLblRawAbs = CreateWindowA("STATIC", "ABS signal: 0.0000", WS_CHILD | WS_VISIBLE, 180, 560, 140, 20, hWnd, NULL, hInst, NULL);
             SendMessage(hLblRawAbs, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
 
-            hLblRawSlipL = CreateWindowA("STATIC", "SlipL: 0.0000", WS_CHILD | WS_VISIBLE, 32, 530, 140, 20, hWnd, NULL, hInst, NULL);
+            hLblRawSlipL = CreateWindowA("STATIC", "Ratio FL: 0.0000", WS_CHILD | WS_VISIBLE, 32, 585, 140, 20, hWnd, NULL, hInst, NULL);
             SendMessage(hLblRawSlipL, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
 
-            hLblRawSlipR = CreateWindowA("STATIC", "SlipR: 0.0000", WS_CHILD | WS_VISIBLE, 180, 530, 140, 20, hWnd, NULL, hInst, NULL);
+            hLblRawSlipR = CreateWindowA("STATIC", "Ratio FR: 0.0000", WS_CHILD | WS_VISIBLE, 180, 585, 140, 20, hWnd, NULL, hInst, NULL);
             SendMessage(hLblRawSlipR, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
 
-            hLblRawSusL = CreateWindowA("STATIC", "SusL: 0.0000", WS_CHILD | WS_VISIBLE, 32, 555, 140, 20, hWnd, NULL, hInst, NULL);
+            hLblRawSusL = CreateWindowA("STATIC", "RoadL: 0.0000", WS_CHILD | WS_VISIBLE, 32, 610, 140, 20, hWnd, NULL, hInst, NULL);
             SendMessage(hLblRawSusL, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
 
-            hLblRawSusR = CreateWindowA("STATIC", "SusR: 0.0000", WS_CHILD | WS_VISIBLE, 180, 555, 140, 20, hWnd, NULL, hInst, NULL);
+            hLblRawSusR = CreateWindowA("STATIC", "RoadR: 0.0000", WS_CHILD | WS_VISIBLE, 180, 610, 140, 20, hWnd, NULL, hInst, NULL);
             SendMessage(hLblRawSusR, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
 
             refreshPortList();
@@ -423,7 +946,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HWND hCtl = (HWND)lParam;
             SetBkMode(hdc, TRANSPARENT);
 
-            if (hCtl == hLblAbsStat) {
+            if (hCtl == hLblPanicStat) {
+                if (g_esp32Panicked.load()) {
+                    SetTextColor(hdc, RGB(255, 255, 255));
+                    return (INT_PTR)hBrushPanicBg;
+                } else {
+                    SetTextColor(hdc, RGB(0, 230, 118));
+                    return (INT_PTR)hBrushCard;
+                }
+            } else if (hCtl == hLblAbsStat) {
                 if (g_live.absActive.load()) {
                     SetTextColor(hdc, RGB(255, 255, 255));
                     return (INT_PTR)hBrushActiveAbs;
@@ -494,9 +1025,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             FillRect(hdc, &rcCard2, hBrushCard);
             FrameRect(hdc, &rcCard2, hBrushBtnDark);
 
-            RECT rcCard3 = { 16, 470, 480, 585 };
+            RECT rcCard3 = { 16, 320, 480, 390 };
             FillRect(hdc, &rcCard3, hBrushCard);
             FrameRect(hdc, &rcCard3, hBrushBtnDark);
+
+            RECT rcCard4 = { 16, 525, 480, 640 };
+            FillRect(hdc, &rcCard4, hBrushCard);
+            FrameRect(hdc, &rcCard4, hBrushBtnDark);
 
             EndPaint(hWnd, &ps);
             break;
@@ -508,22 +1043,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 refreshPortList();
             } else if (wmId == IDC_BTN_CONNECT) {
                 if (!isRunning) {
-                    char selPort[32] = { 0 };
-                    int curSel = SendMessage(hComboPorts, CB_GETCURSEL, 0, 0);
-                    if (curSel == CB_ERR) {
-                        MessageBoxA(hWnd, "Please select a valid COM port from the list!", "Port Error", MB_ICONWARNING);
-                        break;
-                    }
-                    SendMessageA(hComboPorts, CB_GETLBTEXT, curSel, (LPARAM)selPort);
-                    strncpy_s(g_serialPortName, selPort, sizeof(g_serialPortName) - 1);
+                    g_serialPortName[0] = '\0';
+                    g_hapticDeviceId[0] = '\0';
                     isRunning = true;
                     g_serialStatus = 0;
                     g_prevSerialStatus = -1;
+                    g_esp32Panicked = false;
+                    g_panicMsgBoxShown = false;
+                    g_pauseSerialWrites = false;
+                    g_panicMessage[0] = '\0';
                     if (workerThread.joinable()) workerThread.join();
-                    workerThread = std::thread(telemetryWorker, std::string(selPort));
+                    if (serialMonitorThread.joinable()) serialMonitorThread.join();
+                    closeSerial();
+                    workerThread = std::thread(telemetryWorker);
+                    serialMonitorThread = std::thread(serialMonitorWorker);
                 } else {
                     isRunning = false;
                     if (workerThread.joinable()) workerThread.join();
+                    if (serialMonitorThread.joinable()) serialMonitorThread.join();
+                    closeSerial();
                 }
             }
             break;
@@ -535,9 +1073,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int ss = g_serialStatus.load();
                 if (ss != g_prevSerialStatus) {
                     g_prevSerialStatus = ss;
-                    if (ss == 1) { // Connected
-                        char statusBuf[128];
-                        sprintf_s(statusBuf, "ESP32: [CONNECTED] %s (115200 baud)", g_serialPortName);
+                    if (ss == 0 && isRunning) { // Discovery in progress
+                        SetWindowTextA(hLblSerialStat, "ESP32: [SEARCHING FOR HAPTIC DEVICE...]");
+                        EnableWindow(hComboPorts, FALSE);
+                        EnableWindow(hBtnRefresh, FALSE);
+                    } else if (ss == 1) { // Connected
+                        char statusBuf[160];
+                        sprintf_s(statusBuf, "ESP32: [AUTO CONNECTED] %s - %s", g_serialPortName, g_hapticDeviceId);
                         SetWindowTextA(hLblSerialStat, statusBuf);
                         EnableWindow(hComboPorts, FALSE);
                         EnableWindow(hBtnRefresh, FALSE);
@@ -545,6 +1087,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         char statusBuf[128];
                         sprintf_s(statusBuf, "ESP32: [FAILED TO OPEN %s]", g_serialPortName);
                         SetWindowTextA(hLblSerialStat, statusBuf);
+                        EnableWindow(hComboPorts, TRUE);
+                        EnableWindow(hBtnRefresh, TRUE);
+                    } else if (ss == 4) { // No matching firmware identity
+                        SetWindowTextA(hLblSerialStat, "ESP32: [HAPTIC DEVICE NOT FOUND]");
                         EnableWindow(hComboPorts, TRUE);
                         EnableWindow(hBtnRefresh, TRUE);
                     } else if (ss == 3) { // Disconnected
@@ -555,36 +1101,31 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     InvalidateRect(hBtnConnect, NULL, TRUE);
                 }
 
-                // Check Assetto Corsa state even before connecting to ESP32
+                // Check the simulator even before connecting to ESP32.
                 if (!isRunning) {
-                    HANDLE hAcTest = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\acpmf_physics");
-                    if (hAcTest) {
-                        SPageFilePhysics* testPf = (SPageFilePhysics*)MapViewOfFile(hAcTest, FILE_MAP_READ, 0, 0, sizeof(SPageFilePhysics));
-                        if (testPf) {
-                            if (testPf->packetId != g_lastCheckPacketId) {
-                                g_live.acState = 2; // Active Driving
-                                g_lastCheckPacketId = testPf->packetId;
-                                g_idleAcCount = 0;
-                            } else {
-                                g_idleAcCount++;
-                                if (g_idleAcCount > 30) g_live.acState = 1; // Menu / Paused
-                            }
-                            UnmapViewOfFile(testPf);
-                        }
-                        CloseHandle(hAcTest);
-                    } else {
-                        g_live.acState = 0; // Game Closed
+                    static DWORD lastGameProbeTick = 0;
+                    DWORD nowTick = GetTickCount();
+                    if (nowTick - lastGameProbeTick >= 500) {
+                        GameKind detectedGame = detectRunningGame();
+                        g_live.gameKind = static_cast<int>(detectedGame);
+                        g_live.acState = (detectedGame == GameKind::None) ? 0 : 1;
+                        lastGameProbeTick = nowTick;
                     }
                 }
 
-                // Update Assetto Corsa Status
+                // Update simulator status.
                 int acState = g_live.acState.load();
+                GameKind gameKind = static_cast<GameKind>(g_live.gameKind.load());
                 if (acState == 2) {
-                    SetWindowTextA(hLblGameStat, "Assetto Corsa: [CONNECTED] Driving on Track");
+                    SetWindowTextA(hLblGameStat, gameKind == GameKind::ACC
+                        ? "ACC Shared Memory: [RECEIVING]"
+                        : "AC Python API: [RECEIVING]");
                 } else if (acState == 1) {
-                    SetWindowTextA(hLblGameStat, "Assetto Corsa: [CONNECTED] In Menu / Paused");
+                    SetWindowTextA(hLblGameStat, gameKind == GameKind::ACC
+                        ? "ACC: [WAITING FOR SHARED MEMORY]"
+                        : "AC: [WAITING FOR PYTHON APP]");
                 } else {
-                    SetWindowTextA(hLblGameStat, "Assetto Corsa: [NOT DETECTED] Game Closed");
+                    SetWindowTextA(hLblGameStat, "AC / ACC: [NOT DETECTED]");
                 }
 
                 // Stream Rate
@@ -607,7 +1148,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 sprintf_s(brakeBuf, "%d%%", brakePercent);
                 SetWindowTextA(hLblBrakeVal, brakeBuf);
 
-                // ABS Badge (detected via wheelSlip + brake, not the unreliable abs field)
+                // AC derives ABS from SlipRatio; ACC uses absInAction directly.
                 if (g_live.absActive.load()) {
                     SetWindowTextA(hLblAbsStat, ">>> ABS ACTIVE <<<");
                 } else {
@@ -622,20 +1163,54 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 sprintf_s(slipBuf, "%.2f / %.2f", slipL, slipR);
                 SetWindowTextA(hLblSlipVal, slipBuf);
 
-                // Sus
+                // Normalized road intensity
                 char susBuf[64];
-                sprintf_s(susBuf, "FL: %.3fm   |   FR: %.3fm", susL, susR);
+                sprintf_s(susBuf, "FL: %.3f   |   FR: %.3f", susL, susR);
                 SetWindowTextA(hLblSusVal, susBuf);
+
+                // ESP32 Panic Detection
+                if (g_esp32Panicked.load()) {
+                    char panicBuf[300];
+                    char firstLine[200] = {0};
+                    {
+                        std::lock_guard<std::mutex> lock(g_panicMutex);
+                        // Extract only the first line for the small UI label
+                        const char* newlinePos = strchr(g_panicMessage, '\n');
+                        if (newlinePos) {
+                            int len = min((int)(newlinePos - g_panicMessage), 199);
+                            strncpy(firstLine, g_panicMessage, len);
+                            firstLine[len] = '\0';
+                        } else {
+                            strncpy(firstLine, g_panicMessage, 199);
+                        }
+                        sprintf_s(panicBuf, "  [!] ESP32 CRASH: %s", firstLine);
+                    }
+                    SetWindowTextA(hLblPanicStat, panicBuf);
+                    InvalidateRect(hLblPanicStat, NULL, TRUE);
+
+                    // Show MessageBox only once per panic event
+                    if (!g_panicMsgBoxShown.exchange(true)) {
+                        char msgBuf[2500];
+                        {
+                            std::lock_guard<std::mutex> lock(g_panicMutex);
+                            sprintf_s(msgBuf, sizeof(msgBuf), "ESP32 has crashed (fatal panic)!\n\n%s\n\nPlease reset the ESP32.", g_panicMessage);
+                        }
+                        MessageBoxA(hWnd, msgBuf, "ESP32 Fatal Panic", MB_ICONERROR);
+                    }
+                } else if (isConnected.load()) {
+                    SetWindowTextA(hLblPanicStat, "  ESP32 Status: OK");
+                    InvalidateRect(hLblPanicStat, NULL, TRUE);
+                }
 
                 // Raw Data Update
                 float absSetting = g_live.absVal.load();
                 char rawBuf[64];
                 sprintf_s(rawBuf, "Brake: %.4f", brake); SetWindowTextA(hLblRawBrake, rawBuf);
-                sprintf_s(rawBuf, "ABS Set: %.4f", absSetting); SetWindowTextA(hLblRawAbs, rawBuf);
-                sprintf_s(rawBuf, "SlipL: %.4f", slipL); SetWindowTextA(hLblRawSlipL, rawBuf);
-                sprintf_s(rawBuf, "SlipR: %.4f", slipR); SetWindowTextA(hLblRawSlipR, rawBuf);
-                sprintf_s(rawBuf, "SusL: %.4f", susL); SetWindowTextA(hLblRawSusL, rawBuf);
-                sprintf_s(rawBuf, "SusR: %.4f", susR); SetWindowTextA(hLblRawSusR, rawBuf);
+                sprintf_s(rawBuf, "ABS signal: %.4f", absSetting); SetWindowTextA(hLblRawAbs, rawBuf);
+                sprintf_s(rawBuf, "Ratio FL: %.4f", slipL); SetWindowTextA(hLblRawSlipL, rawBuf);
+                sprintf_s(rawBuf, "Ratio FR: %.4f", slipR); SetWindowTextA(hLblRawSlipR, rawBuf);
+                sprintf_s(rawBuf, "RoadL: %.4f", susL); SetWindowTextA(hLblRawSusL, rawBuf);
+                sprintf_s(rawBuf, "RoadR: %.4f", susR); SetWindowTextA(hLblRawSusR, rawBuf);
             }
             break;
         }
@@ -644,12 +1219,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             KillTimer(hWnd, 1);
             isRunning = false;
             if (workerThread.joinable()) workerThread.join();
+            if (serialMonitorThread.joinable()) serialMonitorThread.join();
+            closeSerial();
 
             DeleteObject(hBrushBg);
             DeleteObject(hBrushCard);
             DeleteObject(hBrushBtnDark);
             DeleteObject(hBrushActiveAbs);
             DeleteObject(hBrushInactiveAbs);
+            DeleteObject(hBrushPanicBg);
             DeleteObject(hFontRegular);
             DeleteObject(hFontBold);
             DeleteObject(hFontTitle);
@@ -666,6 +1244,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    if (lpCmdLine && strstr(lpCmdLine, "--self-test")) {
+        NormalizedTelemetry testPacket;
+        testPacket.sequence = 42;
+        testPacket.brake = 0.75f;
+        testPacket.speedKmh = 123.4f;
+        testPacket.slipRatioFL = 0.12f;
+        testPacket.slipRatioFR = 0.15f;
+        testPacket.ndSlipFL = 0.8f;
+        testPacket.ndSlipFR = 0.9f;
+        testPacket.suspensionFL = 0.045f;
+        testPacket.suspensionFR = 0.046f;
+        float roadTest = calculateRoadIntensity(0.051f, 0.050f, 0.10f, 1.0f / 60.0f);
+        return (validateTelemetry(testPacket) && std::fabs(roadTest - 0.60f) < 0.001f) ? 0 : 2;
+    }
+
     timeBeginPeriod(1);
     hInst = hInstance;
 
@@ -683,7 +1276,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         "HapticPedalDarkGUI",
         "get_telemetry",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 510, 640,
+        CW_USEDEFAULT, CW_USEDEFAULT, 510, 700,
         NULL, NULL, hInstance, NULL
     );
 
