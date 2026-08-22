@@ -408,3 +408,25 @@ flowchart TD
 
 1. **ABS Hydraulic Cycling Benchmark (10–15 Hz):**
    - **Bosch Automotive Handbook (10th Edition).** Robert Bosch GmbH. "Antilock Braking Systems (ABS) - Hydraulic Valve Modulation and Pressure Cycling".
+
+
+
+# Contribution
+
+## My contributions
+- Designed the overall PC-to-ESP32 telemetry pipeline.
+- Developed the haptic response and mapping logic.
+- Tuned and validated the haptic response.
+- Designed ESP32 architectutre :
+1. separating time-critical control from communication and background tasks.
+2. Using hardware timers for deterministic timing.
+- Wrote the CLI prototype for get_telemetry app.
+- Integrated and tested the system on sim-racing pedals.
+- Writing project documentation.
+
+## External / AI-assisted Components
+- Used generative AI extensively to implement the GUI application based on my specifications and system design.
+- Used AI to assist with technical documentation, including formalizing mathematical expressions, generating Mermaid diagrams from my system designs, and formatting information into tables.
+- Used AI tools selectively for debugging difficult firmware/runtime issues.
+- Some non-core application components were implemented with substantial AI assistance. I understand their role, behavior, and integration within the system, but I did not independently design all of their internal implementation details.
+

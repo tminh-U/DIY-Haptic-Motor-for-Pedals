@@ -38,6 +38,17 @@ void printHapticIdentity() {
         static_cast<uint16_t>(chipId >> 32), static_cast<uint32_t>(chipId));
 }
 
+
+bool check(float absVal, float slipL, float slipR, float roadL, float roadR) {
+    if (!isfinite(absVal) || !isfinite(slipL) || !isfinite(slipR) || !isfinite(roadL) || !isfinite(roadR)) return false;
+    if (absVal < 0.0f || absVal > 1.0f) return false;
+    if (slipL < 0.0f || slipL > 2.01f) return false;
+    if (slipR < 0.0f || slipR > 2.01f) return false;
+    if (roadL < 0.0f || roadL > 1.001f) return false;
+    if (roadR < 0.0f || roadR > 1.001f) return false;
+    return true;
+}
+
 void serial_read(void *pvParameters) {
     // Install the UART driver from Core 0 so its interrupt is allocated there.
     // The 16 kHz GPTimer is created by setup() on Core 1.
@@ -63,16 +74,8 @@ void serial_read(void *pvParameters) {
 
                 float absVal, slipL, slipR, roadL, roadR;
                 int count = sscanf(buffer, "%f,%f,%f,%f,%f", &absVal, &slipL, &slipR, &roadL, &roadR);
-                if (count == 5
-                    && isfinite(absVal) && isfinite(slipL) && isfinite(slipR)
-                    && isfinite(roadL) && isfinite(roadR)
-                    && absVal >= 0.0f && absVal <= 1.0f
-                    && slipL >= 0.0f && slipL <= 2.01f
-                    && slipR >= 0.0f && slipR <= 2.01f
-                    && roadL >= 0.0f && roadL <= 1.001f
-                    && roadR >= 0.0f && roadR <= 1.001f) {
+                if (count == 5 && check(absVal, slipL, slipR, roadL, roadR)) {
                     publishTelemetry(absVal, max(roadL, roadR), max(slipL, slipR));
-
                     lastValidPacket = millis();
                     watchdogActive = false;
                     digitalWrite(LED_PIN, HIGH);
