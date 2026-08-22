@@ -39,6 +39,7 @@ struct SPageFilePhysics
     float carDamage[5];
     int numberOfTyresOut;
     int pitLimiterOn;
+    // ACC's live ABS intervention signal (0.0 = inactive, 1.0 = active).
     float abs;
     float kersCharge;
     float kersInput;
@@ -80,6 +81,8 @@ struct SPageFilePhysics
     float slipRatio[4];
     float slipAngle[4];
     int tcInAction;
+    // Retained only to preserve the documented shared-memory layout. ACC does
+    // not populate this legacy compatibility field; use `abs` above instead.
     int absInAction;
     float suspensionDamage[4];
     float tyreTemp[4];
@@ -110,6 +113,8 @@ struct SPageFileStatic
 
 static_assert(offsetof(SPageFilePhysics, suspensionTravel) == 184,
     "Unexpected ACC suspensionTravel offset");
+static_assert(offsetof(SPageFilePhysics, abs) == 252,
+    "Unexpected ACC abs offset");
 static_assert(offsetof(SPageFilePhysics, slipRatio) == 640,
     "Unexpected ACC slipRatio offset");
 static_assert(offsetof(SPageFilePhysics, absInAction) == 676,

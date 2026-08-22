@@ -49,7 +49,7 @@ flowchart LR
 ```mermaid
 flowchart TD
     A["AC Python API<br/>SlipRatio / NdSlip / SuspensionTravel"] -->|"haptic_telemetry_v1"| B["get_telemetry.exe<br/>Longitudinal brake-slip gating"]
-    C["ACC shared memory<br/>SlipRatio / absInAction / SuspensionTravel"] --> B
+    C["ACC shared memory<br/>SlipRatio / abs / SuspensionTravel"] --> B
     S["Static shared memory<br/>Max suspension travel when available"] --> B
     B -->|Serial| C["ESP32<br/>Synthesizes waveform at 16 kHz"]
     C -->|DAC output| D["Amp - class D<br/>TPA3116D2"]
@@ -59,7 +59,7 @@ flowchart TD
 **Pipeline stages:**
 
 1. **AC Python app** - `assetto_corsa_python_app/haptic_telemetry` runs only inside Assetto Corsa and accesses the explicitly named `SlipRatio`, `NdSlip`, and `SuspensionTravel` channels. This avoids interpreting AC's undocumented shared-memory `wheelSlip` field as a physical longitudinal slip ratio.
-2. **ACC direct reader** - no Python app is required. The host reads ACC's extended `SPageFilePhysics`, using front `slipRatio`, `suspensionTravel`, and the native `absInAction` intervention flag.
+2. **ACC direct reader** - no Python app is required. The host reads ACC's `SPageFilePhysics`, using front `slipRatio`, `suspensionTravel`, and the native `abs` intervention signal.
 3. **`get_telemetry.exe`** - automatically detects AC or ACC, validates coherent frames, gates longitudinal slip to braking above 3 km/h, and normalizes road input. `acpmf_static.suspensionMaxTravel` is used when valid; otherwise the road calculation falls back to `0.10 m`.
 4. **ESP32** - receives the relevant values over serial, applies the effect logic (priority, weighting, carrier-modulation as described in Design Rationale), and continuously synthesizes a waveform sample-by-sample, output through its internal DAC.
 5. **Class D amp (TPA3116D2)** - amplifies the low-power DAC signal enough to drive the exciter.
@@ -148,7 +148,7 @@ $$\text{DAC}_{\text{ABS}}(t) = 128 + (105 \cdot \text{absVal}) \cdot y_{\text{AB
 This ~60:40 duty cycle (50 ms ON / 33.33 ms OFF) maintains the realistic 12 hydraulic cycles per second of an ABS system while delivering sharp, instantaneous tactile impacts to the pedal.
 
 **[22/8/2026 Update - ABS data]:**
-For Assetto Corsa, the shared-memory `abs` field is not treated as a moment-by-moment activation flag. ABS onset is derived from the Python API's front longitudinal slip ratios; the shared-memory field only confirms availability and optionally supplies a plausible `0.03..0.30` threshold. For Assetto Corsa Competizione, the host uses the native shared-memory `absInAction` flag directly, so no inferred ABS threshold is required.
+For Assetto Corsa, the shared-memory `abs` field is not treated as a moment-by-moment activation flag. ABS onset is derived from the Python API's front longitudinal slip ratios; the shared-memory field only confirms availability and optionally supplies a plausible `0.03..0.30` threshold. For Assetto Corsa Competizione, the host uses the native shared-memory `abs` intervention signal directly, so no inferred ABS threshold is required. ACC's later `absInAction` compatibility field is not used because the game does not populate it.
 
 $$\text{absVal} = (\text{brake} > 0.05 \ \land \ \text{speed} > 3\text{ km/h} \ \land \ \text{ABS enabled} \ \land \ \max(|\kappa_{FL}|, |\kappa_{FR}|) \ge \kappa_{ABS})$$
 
@@ -280,10 +280,10 @@ ACC is read directly from its extended `Local\acpmf_physics` page using the layo
 |---|---|
 | `brake`, `speedKmh` | Brake and low-speed gates |
 | `slipRatio[FL, FR]` | Longitudinal slip feedback |
-| `absInAction` | Native ABS intervention flag |
+| `abs` | Native ABS intervention signal (`0.0` inactive, `1.0` active) |
 | `suspensionTravel[FL, FR]` | Normalized road effect |
 
-The reader checks `packetId` before and after copying a frame to reject torn shared-memory reads. ACC's legacy `wheelSlip` and `abs` fields are not used for haptic activation.
+The reader checks `packetId` before and after copying a frame to reject torn shared-memory reads. ACC's legacy `wheelSlip` and unused `absInAction` fields are not used for haptic activation.
 
 ##### Serial Protocol
 Data is formatted as a CSV string and transmitted at **115200 baud, 8-N-1** over USB-UART.
@@ -371,7 +371,7 @@ flowchart TD
     end
 
     subgraph ACC ["1b. Assetto Corsa Competizione"]
-        ACCPhysics[("Extended shared memory\nSlipRatio / absInAction / SuspensionTravel")]
+        ACCPhysics[("Shared memory\nSlipRatio / abs / SuspensionTravel")]
     end
 
     subgraph Host ["2. get_telemetry.exe"]
