@@ -1,0 +1,49 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "ESP32: Build",
+            "type": "process",
+            "command": "${env:LOCALAPPDATA}\\Programs\\Arduino CLI\\arduino-cli.exe",
+            "args": [
+                "compile",
+                "--fqbn",
+                "esp32:esp32:esp32doit-devkit-v1",
+                "${workspaceFolder}\\haptic_firmware"
+            ],
+            "problemMatcher": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "ESP32: Build and Upload COM4",
+            "type": "process",
+            "command": "${env:LOCALAPPDATA}\\Programs\\Arduino CLI\\arduino-cli.exe",
+            "args": [
+                "compile",
+                "--upload",
+                "--fqbn",
+                "esp32:esp32:esp32doit-devkit-v1",
+                "--port",
+                "COM4",
+                "${workspaceFolder}\\haptic_firmware"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "ESP32: Serial Monitor COM4",
+            "type": "process",
+            "command": "${env:LOCALAPPDATA}\\Programs\\Arduino CLI\\arduino-cli.exe",
+            "args": [
+                "monitor",
+                "--port",
+                "COM4",
+                "--config",
+                "baudrate=115200"
+            ],
+            "problemMatcher": []
+        }
+    ]
+}

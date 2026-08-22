@@ -27,39 +27,43 @@ This project is a DIY guide to building a haptic feedback system for sim racing 
 # System architecture
 ```mermaid
 flowchart LR
-    A["Assetto Corsa<br/>get_telemetry (120Hz)"] -->|Serial| B["ESP32<br/>Waveform Synthesizer"]
-    B -->|DAC GPIO 25| C["Amp - Class D<br/>TPA3116D2"]
-    C -->|Audio Signal| D["Sound Exciter<br/>Haptic Pedal"]
-    E["Power Supply<br/>12V 3A"] -->|Power| C
+    A["Assetto Corsa<br/>Python API"] -->|"Private memory map<br/>60 Hz"| B["get_telemetry.exe"]
+    G["Assetto Corsa Competizione<br/>Shared memory"] -->|"Direct reader<br/>60 Hz"| B
+    B -->|Serial| C["ESP32<br/>Waveform Synthesizer"]
+    C -->|DAC GPIO 25| D["Amp - Class D<br/>TPA3116D2"]
+    D -->|Audio Signal| E["Sound Exciter<br/>Haptic Pedal"]
+    F["Power Supply<br/>12V 3A"] -->|Power| D
 ```
-- **Signal path**  - Game physics telemetry is read directly from shared memory at 120 Hz (`get_telemetry()`) and transmitted to the ESP32 over Serial. The ESP32 parses the telemetry, applies the effect mapping logic, and continuously synthesizes analog waveforms through its internal DAC (GPIO 25). The signal is amplified by the TPA3116D2 Class D amplifier to drive the sound exciter mounted on the pedal.
+- **Signal path** - Assetto Corsa uses the bundled Python app to publish physical `SlipRatio` and suspension data through `haptic_telemetry_v1`. Assetto Corsa Competizione needs no Python app: `get_telemetry.exe` reads its extended shared-memory physics page directly. Both paths are normalized to the same five-field serial packet, and the ESP32 synthesizes waveforms at 16 kHz through its internal DAC (GPIO 25).
 
 
 # Supported features :
+- **Supported games** - Assetto Corsa (Python telemetry bridge) and Assetto Corsa Competizione (direct shared memory, automatically detected).
 - **ABS Feedback** -- When ABS intervenes, it pulses the brakes rapidly via a hydraulic modulator to prevent wheel lock-up. This causes the pedal to judder/vibrate.
 - **Lock-up / Tire Slip** -- When the car locks up or the tires slip, kinetic friction between the tires and the road generates vibration that travels back through the suspension and chassis to the seat and pedals. To simplify this effect, this motor simulates a similar vibration pattern to what is felt at the seat, but at a weaker intensity.
-- **Road Effect** - When the front tires hit a kerb, gravel, or debris, the impact vibration travels back through the pedals in a real car. This system reproduces that sensation using the game's surface/road-texture telemetry, mapped to vibration intensity on the pedal.
+- **Road Effect** - When the front tires hit a kerb, gravel, or debris, the impact vibration travels back through the pedals in a real car. This system derives that sensation from the normalized vertical speed of the front suspension.
 
 # Design rationale & control logic
 
 
 ```mermaid
 flowchart TD
-    A["Game shared memory<br/>acpmf_physics raw bytes"] --> B["get_telemetry()<br/>Bytes to named variables:<br/>abs, wheelSlip, suspensionTravel"]
-    B -->|Serial| C["ESP32<br/>Synthesizes waveform"]
+    A["AC Python API<br/>SlipRatio / NdSlip / SuspensionTravel"] -->|"haptic_telemetry_v1"| B["get_telemetry.exe<br/>Longitudinal brake-slip gating"]
+    C["ACC shared memory<br/>SlipRatio / absInAction / SuspensionTravel"] --> B
+    S["Static shared memory<br/>Max suspension travel when available"] --> B
+    B -->|Serial| C["ESP32<br/>Synthesizes waveform at 16 kHz"]
     C -->|DAC output| D["Amp - class D<br/>TPA3116D2"]
     D --> E["Sound exciter<br/>Vibration on pedal"]
 ```
 
 **Pipeline stages:**
 
-1. **Game shared memory** - the game (AC) continuously writes raw physics data into a named memory-mapped block (`acpmf_physics`), updated every simulation step.
-2. **`get_telemetry()`** - a function on the PC side that opens this shared memory block and casts the raw bytes into a struct (`SPageFilePhysics`), exposing named fields such as `abs`, `wheelSlip[4]`, and `suspensionTravel[4]`.
-
-   **Note:** SimHub was initially considered for this step, since it already exposes many of these values in a standardized way across games. However, the free version limits the output rate to 10Hz, while the game itself updates physics data at up to 120Hz. Since a low, fixed update rate would make fast effects like ABS pulsing feel noticeably stepped, `get_telemetry()` was written to read the shared memory directly, bypassing this limitation and preserving the game's native update rate.
-3. **ESP32** - receives the relevant values over serial, applies the effect logic (priority, weighting, carrier-modulation as described in Design Rationale), and continuously synthesizes a waveform sample-by-sample, output through its internal DAC.
-4. **Class D amp (TPA3116D2)** - amplifies the low-power DAC signal enough to drive the exciter.
-5. **Sound exciter** - converts the amplified electrical signal into physical vibration felt through the pedal.
+1. **AC Python app** - `assetto_corsa_python_app/haptic_telemetry` runs only inside Assetto Corsa and accesses the explicitly named `SlipRatio`, `NdSlip`, and `SuspensionTravel` channels. This avoids interpreting AC's undocumented shared-memory `wheelSlip` field as a physical longitudinal slip ratio.
+2. **ACC direct reader** - no Python app is required. The host reads ACC's extended `SPageFilePhysics`, using front `slipRatio`, `suspensionTravel`, and the native `absInAction` intervention flag.
+3. **`get_telemetry.exe`** - automatically detects AC or ACC, validates coherent frames, gates longitudinal slip to braking above 3 km/h, and normalizes road input. `acpmf_static.suspensionMaxTravel` is used when valid; otherwise the road calculation falls back to `0.10 m`.
+4. **ESP32** - receives the relevant values over serial, applies the effect logic (priority, weighting, carrier-modulation as described in Design Rationale), and continuously synthesizes a waveform sample-by-sample, output through its internal DAC.
+5. **Class D amp (TPA3116D2)** - amplifies the low-power DAC signal enough to drive the exciter.
+6. **Sound exciter** - converts the amplified electrical signal into physical vibration felt through the pedal.
 
 
 
@@ -139,42 +143,31 @@ $$E_{\text{ABS}}(t) = \begin{cases}
 
 $$\Rightarrow y_{\text{ABS}}(t) = E_{\text{ABS}}(t) \cdot \sin(2\pi \cdot 60 \cdot t)$$
 
-$$\text{DAC}_{\text{ABS}}(t) = 128 + (105 \cdot \text{brakeVal}) \cdot y_{\text{ABS}}(t) \quad (\text{active when } \text{absVal} = 1)$$
+$$\text{DAC}_{\text{ABS}}(t) = 128 + (105 \cdot \text{absVal}) \cdot y_{\text{ABS}}(t) \quad (\text{active when } \text{absVal} = 1)$$
 
 This ~60:40 duty cycle (50 ms ON / 33.33 ms OFF) maintains the realistic 12 hydraulic cycles per second of an ABS system while delivering sharp, instantaneous tactile impacts to the pedal.
 
-**[20/8/2026 Update - ABS data]:**
-There is a problem, the pf->abs in the shared memory is the stage of ABS that the current car used, not the abs engage flag. So the ABS is actived by a new formula :
+**[22/8/2026 Update - ABS data]:**
+For Assetto Corsa, the shared-memory `abs` field is not treated as a moment-by-moment activation flag. ABS onset is derived from the Python API's front longitudinal slip ratios; the shared-memory field only confirms availability and optionally supplies a plausible `0.03..0.30` threshold. For Assetto Corsa Competizione, the host uses the native shared-memory `absInAction` flag directly, so no inferred ABS threshold is required.
 
-$$\text{absVal} = (\text{brakeVal} > 0.05 \ \land \ \max(\text{slipL}, \text{slipR}) > 0.8 \ \land \ \text{pf->abs} > 0)$$
-
-2. **Road Effect:** 
-When the tires hit a big bump or kerb or, it imparts an impulse shock to the suspension. Based on previous sim racing hardware builders' experience, 75Hz is the chosen frequency with an intensity proportional to the vertical suspension displacement rate ($\Delta \text{Sus}$). However, the suspensions act like a Low-pass filter, so maybe only big kerb or bumps is clearly felt in the pedal.
+$$\text{absVal} = (\text{brake} > 0.05 \ \land \ \text{speed} > 3\text{ km/h} \ \land \ \text{ABS enabled} \ \land \ \max(|\kappa_{FL}|, |\kappa_{FR}|) \ge \kappa_{ABS})$$
 
 
-To simulate this tactile feel through the sound exciter, the amplitude is modulated by the frame-to-frame suspension velocity:
+2. **Road Effect:**
+When a front tire hits road texture, a bump, or a kerb, its suspension travel changes rapidly. A raw metre-per-frame threshold behaves very differently between cars and was too insensitive at 60 Hz, so the PC now divides the travel change by both elapsed time and the current car's maximum suspension travel:
 
-$$\Delta \text{Sus}(t) = \max\Big(|\text{SusL}(t) - \text{SusL}(t-1)|, \ |\text{SusR}(t) - \text{SusR}(t-1)|\Big)$$
+$$v_{\text{road},i}(t) = \frac{|\text{Sus}_i(t)-\text{Sus}_i(t-1)|}{\text{SusMax}_i \cdot \Delta t}, \qquad i \in \{FL,FR\}$$
 
-$$A_{\text{road}}(t) = \min\left(30, \ \Delta \text{Sus}(t) \cdot \frac{30}{0.015}\right)$$
+$$R(t) = \min\left(1,\max(v_{\text{road},FL}(t),v_{\text{road},FR}(t))\right)$$
 
-$$\text{DAC}_{\text{road}}(t) = A_{\text{road}}(t) \cdot \sin(2\pi \cdot 100 \cdot t)$$
+$$A_{\text{road}}(t) = 70R(t)$$
 
-**Note :**  
+$$\text{DAC}_{\text{road}}(t) = A_{\text{road}}(t) \cdot \sin(2\pi \cdot 75 \cdot t)$$
 
-* $0.015$$m$ is the maximum displacement of the suspension system in this build in 1 frame.
-* The frequency run continiously from the start. 
-* EMA smoothing uses an asymmetric decay ($\alpha = 0.0038$) when $\Delta\text{Sus}$ decreases to eliminate abrupt popping noises while preserving a punchy and crisp kerb impact (~95ms settling time).
+`SusMax` comes from `Local\acpmf_static.suspensionMaxTravel`; the host falls back to `0.10 m` if the value is absent, invalid, or not populated by ACC. `R=1` means motion equivalent to one full suspension travel per second, not one full travel in a single frame. The ESP32 applies asymmetric EMA smoothing (`0.01131` attack, `0.0038` release) to keep kerb impacts crisp without an abrupt pop.
 
-3. **Lock-up / Tire Slip:** 
-When the tires exceed the peak friction threshold, kinetic stick-slip friction and in-plane carcass torsional deformation generate continuous low-frequency vibrations. 
-
-According to **Pacejka's $\mu\text{–Slip}$ Magic Formula curve** (*Tire and Vehicle Dynamics*), racing tires reach their peak braking friction ($\mu_{\max}$) at approximately $15\%\text{-}20\%$ longitudinal slip ratio ($\text{Slip} = 0.15\text{-}0.20$). Beyond $25\%\text{-}30\%$ slip, the tire exits the elastic grip zone and enters the unstable kinetic sliding region. 
-
-To provide intuitive driver feedback without unnecessary foot fatigue during normal braking, a **threshold deadband of $\text{Slip} = 0.30$** is implemented:
-- **$\text{Slip} < 0.30$ (Optimal Grip Zone):** The pedal remains completely smooth, confirming to the driver that braking is operating within the maximum traction envelope.
-- **$0.30 \le \text{Slip} < 1.50$ (Progressive Scrub / Impending Lock-up):** The exciter vibrates at 45 Hz with an amplitude scaling linearly from $10 \rightarrow 37$, warning the driver to modulate brake pressure before a full lock-up occurs.
-- **$\text{Slip} \ge 1.50$ (Full Lock-up):** Continuous maximum 45 Hz vibration (capped at 37) prompting an immediate brake release.
+3. **Lock-up / Longitudinal Brake Slip:**
+The input is the physical longitudinal slip ratio: the Python API's `SlipRatio` channel in AC and shared-memory `slipRatio[FL,FR]` in ACC. Shared-memory `wheelSlip` is not used. The effect is gated by brake input, so controlled lateral sliding and drift do not activate the pedal. A light warning starts at 3% longitudinal slip, before wheel lock, then becomes progressively stronger through the tyre-limit region and toward the full-lock reference at ratio 1.0.
 
 $$
 \begin{aligned}
@@ -187,22 +180,25 @@ Where the amplitude $A_{\text{slip}}(t)$ is defined by the piecewise mapping fun
 
 $$
 A_{\text{slip}}(t) = \begin{cases} 
-0 & \text{if } \text{Slip}_{\text{front}} < 0.30 \quad (\text{Optimal Grip / Peak Friction}) \\
-10 + 27 \cdot \left( \frac{\text{Slip}_{\text{front}} - 0.30}{1.50 - 0.30} \right) & \text{if } 0.30 \le \text{Slip}_{\text{front}} < 1.50 \quad (\text{Progressive Slip}) \\
-37 & \text{if } \text{Slip}_{\text{front}} \ge 1.50 \quad (\text{Full Lock-up})
+0 & \text{if } \text{Slip}_{\text{front}} < 0.03 \\
+8 + 12 \cdot \frac{\text{Slip}_{\text{front}}-0.03}{0.07} & \text{if } 0.03 \le \text{Slip}_{\text{front}} < 0.10 \\
+20 + 25 \cdot \frac{\text{Slip}_{\text{front}}-0.10}{0.15} & \text{if } 0.10 \le \text{Slip}_{\text{front}} < 0.25 \\
+45 + 40 \cdot \frac{\text{Slip}_{\text{front}}-0.25}{0.75} & \text{if } 0.25 \le \text{Slip}_{\text{front}} \le 1.00 \\
+85 & \text{if } \text{Slip}_{\text{front}} > 1.00
 \end{cases}
 $$
 
-**Note :** 50Hz is the chosen frequency based on previous sim racing DIY builders' experience and physical testing.
+**Note :** 50Hz and 90Hz is the chosen frequency based on previous sim racing DIY builders' experience and physical testing. The sine wave frequency is randomized by `xorshift32()` function.
 
 ### Tire Slip Mapping & Perception Breakdown:
 
-| Slip Value ($\text{Slip}_{\text{front}}$) | Tire Physical State (Pacejka Model) | Amplitude Formula ($A_{\text{slip}}$) | Output Amplitude ($A$) | Tactile Perception / Driver Feedback |
-|---|---|---|---|---|
-| **$0.00 \le \text{Slip} < 0.30$** | **Optimal Grip** (Peak friction zone, $\mu \le \mu_{\text{max}}$) | $A = 0$ | **$0$ (Off)** | Pedal remains completely smooth; maximum braking efficiency. |
-| **$0.30 \le \text{Slip} < 0.80$** | **Light Slip** (Exceeding peak grip boundary) | $A = 10 + 27 \cdot \left(\frac{\text{Slip} - 0.3}{1.2}\right)$ | **$10 \rightarrow 21$** | Smooth, subtle 50 Hz rumble indicating tire scrub. |
-| **$0.80 \le \text{Slip} < 1.50$** | **Heavy Slip** (Approaching full lock-up) | $A = 10 + 27 \cdot \left(\frac{\text{Slip} - 0.3}{1.2}\right)$ | **$21 \rightarrow 37$** | Strong, distinct vibration warning the driver to modulate brake pressure. |
-| **$\text{Slip} \ge 1.50$** | **Full Lock-up** (Wheel rotation halted) | $A = 37$ (Capped) | **$37$ (Max)** | Heavy continuous 50 Hz rumble prompting immediate brake release. |
+| Slip Value ($\text{Slip}_{\text{front}}$) | State | Amplitude | Tactile feedback |
+|---|---|---|---|
+| **$0.00 \le \text{Slip} < 0.03$** | Rolling / telemetry noise | **0** | Deadband; pedal stays smooth. |
+| **$0.03 \le \text{Slip} < 0.10$** | Early longitudinal slip | **8 to 20** | Light warning before the wheel approaches lock. |
+| **$0.10 \le \text{Slip} < 0.25$** | Tyre-limit / ABS region | **20 to 45** | Clearly increasing warning. |
+| **$0.25 \le \text{Slip} \le 1.00$** | Heavy slip toward lock-up | **45 to 85** | Strong warning to release brake pressure. |
+| **$\text{Slip} > 1.00$** | Clamped extreme input | **85** | Maximum output without telemetry spikes consuming headroom. |
 
 
 ### Signal Mixing & Headroom Management
@@ -244,22 +240,117 @@ $$H_M = \frac{\text{Max DAC Amplitude}}{\text{Max ABS} + \text{Max Road} + \text
 
 
 ### Software :
-
-- CLI version : read_and_send.exe
 - GUI version : get_telemetry.exe
 
+
 - C++ was used for best performance and reduce packet loss or late data transfer when sending the game telemetry data to ESP32
+
+##### Installation and startup
+
+For **Assetto Corsa**:
+
+1. Copy `assetto_corsa_python_app/haptic_telemetry` to `<Assetto Corsa>/apps/python/haptic_telemetry`.
+2. Enable **Haptic Telemetry** in Assetto Corsa or Content Manager's Python Apps settings.
+3. Start a driving session, run `get_telemetry.exe`, and click **CONNECT**. The app scans the available COM ports and connects only to the ESP32 that identifies itself as a haptic controller.
+4. Confirm that the GUI shows `ESP32: [AUTO CONNECTED] COMx - <device ID>`, `AC Python API: [RECEIVING]`, and a stream rate close to 60 Hz.
+
+For **Assetto Corsa Competizione**, no Python app or UDP configuration is required. Start a driving session, open `get_telemetry.exe`, and connect the ESP32. The GUI should show `ACC Shared Memory: [RECEIVING]`.
+
+The host automatically distinguishes `acs.exe` from `AC2-Win64-Shipping.exe`/`acc.exe`. If either telemetry source stops for more than 250 ms, the PC app sends zeros to silence the motor. The ESP32 independently silences its output after 500 ms without a valid serial packet.
+
+
+##### Assetto Corsa Python API bridge
+Install `assetto_corsa_python_app/haptic_telemetry` into Assetto Corsa's `apps/python` directory and enable **Haptic Telemetry**. The in-game app publishes the following `HPT1` fields through `haptic_telemetry_v1`:
+
+| Field | Source | Usage |
+|---|---|---|
+| `brake` | `acsys.CS.Brake` | Gates all longitudinal brake-slip effects |
+| `speedKmh` | `acsys.CS.SpeedKMH` | Suppresses low-speed telemetry noise |
+| `slipRatio[FL, FR]` | `acsys.CS.SlipRatio` | ABS and lock-up detection |
+| `ndSlip[FL, FR]` | `acsys.CS.NdSlip` | Diagnostic only; never drives the brake pedal |
+| `suspensionTravel[FL, FR]` | `acsys.CS.SuspensionTravel` | Input to normalized suspension-velocity road effect |
+
+`get_telemetry.exe` opens `Local\acpmf_physics` only for the ABS enabled/configuration hint and `Local\acpmf_static` for `suspensionMaxTravel`. It does not read shared-memory `wheelSlip` for haptic output.
+
+##### Assetto Corsa Competizione direct bridge
+
+ACC is read directly from its extended `Local\acpmf_physics` page using the layout in `get_telemetry/structed_file_ACC.h`:
+
+| Field | Usage |
+|---|---|
+| `brake`, `speedKmh` | Brake and low-speed gates |
+| `slipRatio[FL, FR]` | Longitudinal slip feedback |
+| `absInAction` | Native ABS intervention flag |
+| `suspensionTravel[FL, FR]` | Normalized road effect |
+
+The reader checks `packetId` before and after copying a frame to reject torn shared-memory reads. ACC's legacy `wheelSlip` and `abs` fields are not used for haptic activation.
+
+##### Serial Protocol
+Data is formatted as a CSV string and transmitted at **115200 baud, 8-N-1** over USB-UART.
+
+```text
+absActive,slipRatioFL,slipRatioFR,roadIntensityFL,roadIntensityFR\n
+```
+
+##### Automatic ESP32 discovery
+
+The ESP32 has a stable eFuse MAC identifier. On every connection attempt, the PC app opens each available COM port with DTR/RTS disabled, sends the following request, and keeps only the port that returns the expected protocol prefix:
+
+```text
+PC   -> ID?\n
+ESP32 -> HAPTIC_PEDAL,1,<12-digit-eFuse-MAC>\n
+```
+
+For example, `HAPTIC_PEDAL,1,00C4D2BD2A58` is a valid wire response. This means COM port numbering may change after reconnecting USB without requiring the user to select a port manually.
+
+
 
 
 ### Firmware :
 
-- Dual core computing (parallel computing): 
-1. Using Core 0 for reading telemetry data from the game and assigning the global variables.
-2. Using Core 1 for generating waveform (ABS, Slip, Road effect) (EMA smoothing, etc.) and sending it to DAC using hardware timer and interrupt with sampling rate of 16000Hz.
+##### Dual-core architecture: 
+1. **Core 0 - UART receiver:** The `serial_read` task initializes `Serial` and receives telemetry packets. Initializing the UART driver from this pinned task allocates its UART interrupt on Core 0, then publishes a coherent telemetry snapshot for the waveform engine.
+2. **Core 1 - waveform engine:** `setup()` creates the GPTimer on Core 1. Its 16 kHz ISR generates ABS, slip, and road waveforms, then writes the DAC output on GPIO 25.
 
-- Status indicator using LED when telemetry packets are actively received and zero loss.
+Keeping the UART ISR on Core 0 and the GPTimer ISR on Core 1 prevents the high-rate timer callback from competing with UART receive interrupts on the same shared interrupt path when the PC starts streaming telemetry.
 
-- Performance and resources :
+
+##### Lock-free telemetry snapshot:
+
+Three `volatile float` values (`cur_absVal`, `road_intensity`, `cur_slip`) are shared between the Core 0 serial task and the Core 1 timer ISR. A single-writer sequence lock keeps the three values in one coherent snapshot without taking another `portMUX` from inside the GPTimer shared interrupt handler.
+
+```cpp
+// Core 0 writer: odd means updating, even means ready.
+__atomic_add_fetch(&telemetry_sequence, 1, __ATOMIC_SEQ_CST);
+cur_absVal = absVal;
+road_intensity = max(roadL, roadR);
+cur_slip   = max(slipL, slipR);
+__atomic_add_fetch(&telemetry_sequence, 1, __ATOMIC_SEQ_CST);
+
+// Core 1 ISR: accept values only when the sequence is unchanged and even.
+uint32_t before = __atomic_load_n(&telemetry_sequence, __ATOMIC_SEQ_CST);
+local_absVal    = cur_absVal;
+local_road_intensity = road_intensity;
+local_slip      = cur_slip;
+uint32_t after  = __atomic_load_n(&telemetry_sequence, __ATOMIC_SEQ_CST);
+```
+
+The ISR retries at most three times and otherwise reuses its last valid snapshot, so it cannot spin indefinitely. This removes nested spinlock operations while retaining a 62.5 microsecond ISR period (16 kHz).
+
+
+##### UART data validation : 
+1. `isfinite()` check - Rejects `NaN`, `+Inf`, `-Inf` values that can result from UART byte corruption (e.g., partial packet, electrical noise). This prevents invalid floating-point values from propagating into the waveform synthesis math, where they would cause undefined behavior or crash.
+
+2. Range validation - Rejects packets unless `absActive` is in `0..1`, each longitudinal slip ratio is in `0..2.01`, and each normalized road intensity is in `0..1.001`.
+
+3. Identity handshake - `ID?` is handled before CSV parsing and returns the immutable ESP32 eFuse MAC with the `HAPTIC_PEDAL,1,` prefix. It does not alter the haptic telemetry or watchdog state.
+
+
+##### Status indicator and Watchdog
+1. LED ON (GREEN): Set `HIGH` when a valid, fully-parsed 5-field packet passes both validation checks.
+2. LED OFF (RED): Set `LOW` when no valid packet has been received for $> 500\text{ms}$, indicating USB disconnection or data loss. The watchdog also zeros all shared variables to silence the motor
+
+##### Performance and resources :
 1. Core 0 utilizes less than 0.2% and Core 1 utilizes less than 0.75% of CPU capacity, reducing latency and performance overhead to nearly 0%.
 2. Memory usage is minimal, with only a few kilobytes of RAM used for storing telemetry data and global variables.
 3. Although sinf(x) is O(1) time complexity, using it still costs a lot of CPU resources and time to solve, so a LUT (Look-up table) is used to reduce the CPU usage and calculation time. Also, when using a high sample rate such as 16000Hz, using the sinf(x) function may cause floating point errors and return incorrect data. Therefore, using LUT is more stable and efficient for generating waveforms. LUT formula : the circle is divided into 1024 parts, so the angle will be : $\theta = 2\pi \cdot \frac{i}{1024}$, so $\sin \theta = \sin(2\pi \cdot \frac{i}{1024})$ where $i$ is the index of the LUT. And a sine wave step after a single sampling is calculated by $\frac{\text{frequency} \times 1024}{\text{sample rate}}$. For example, ABS at 60Hz with 16000Hz sample rate : $\frac{60 \times 1024}{16000} = 3.84$.
@@ -271,52 +362,40 @@ $$H_M = \frac{\text{Max DAC Amplitude}}{\text{Max ABS} + \text{Max Road} + \text
 
 ```mermaid
 flowchart TD
-    subgraph AC ["1. Assetto Corsa (Game Engine)"]
-        GameLoop["Physics Engine (acs.exe)"]
-        SharedMem[("Windows Shared Memory\n'Local\\acpmf_physics'")]
-        GameLoop -->|"Writes physics data @ 120 Hz"| SharedMem
+    subgraph AC ["1. Assetto Corsa"]
+        Physics["Physics engine"]
+        Python["Haptic Telemetry Python app\nSlipRatio / NdSlip / SuspensionTravel"]
+        AbsHint[("Shared memory\nABS hint + suspension max travel")]
+        Physics --> Python
+        Physics --> AbsHint
     end
 
-    subgraph Host ["2. C++ Software Bridge (get_telemetry / read_and_send.cpp)"]
-        MapFile["Memory Mapping\n(MapViewOfFile)"]
-        StructMap["Cast raw buffer to struct\n(SPageFilePhysics* via structed_file.h)"]
-        
-        subgraph ExtractData ["Data Extraction (6 Channels)"]
-            Val1["pf->abs (ABS Active Flag)"]
-            Val2["pf->brake (Brake Pedal Pressure: 0.0 - 1.0)"]
-            Val3["pf->wheelSlip[0, 1] (FL & FR Longitudinal Slip)"]
-            Val4["pf->suspensionTravel[0, 1] (FL & FR Suspension Travel)"]
-        end
+    subgraph ACC ["1b. Assetto Corsa Competizione"]
+        ACCPhysics[("Extended shared memory\nSlipRatio / absInAction / SuspensionTravel")]
+    end
 
-        FormatPacket["Format CSV String Buffer\n'abs,brake,slipL,slipR,susL,susR\\n'"]
-        SerialWrite["Win32 Serial Interface (WriteFile)\n115200 Baud / 8-N-1 @ 120 Hz"]
-
-        SharedMem -->|"Read buffer"| MapFile
-        MapFile -->|"Structured deserialization"| StructMap
-        StructMap --> ExtractData
-        ExtractData --> FormatPacket
-        FormatPacket --> SerialWrite
+    subgraph Host ["2. get_telemetry.exe"]
+        Bridge["Private memory-map reader\nhaptic_telemetry_v1 @ 60 Hz"]
+        ACCReader["ACC direct reader\npacketId coherence check"]
+        Gate["Slip gate + normalized road formula\nUse longitudinal SlipRatio only"]
+        Serial["CSV serial output\n115200 baud"]
+        Bridge --> Gate --> Serial
+        ACCReader --> Gate
     end
 
     subgraph ESP ["3. ESP32 Microcontroller (Firmware)"]
-        UARTCore0["Core 0: UART Receiver Task\nsscanf CSV payload into floats"]
-        EMA["EMA Step-Response Filtering\n(alpha = 0.072 / 42 ISR ticks)"]
-        TimerCore1["Core 1: 5000 Hz Hardware Timer ISR\nWaveform Synthesis (ABS 60Hz + Road 100Hz + Slip 50Hz)"]
+        UARTCore0["Core 0: UART receiver"]
+        Snapshot["Lock-free telemetry snapshot"]
+        TimerCore1["Core 1: 16 kHz waveform ISR"]
         DAC["8-Bit Hardware DAC (GPIO 25)\nDirect Register: RTC_IO_PAD_DAC1_REG"]
-
-        SerialWrite -->|"USB-UART Virtual COM Port"| UARTCore0
-        UARTCore0 --> EMA
-        EMA --> TimerCore1
+        UARTCore0 --> Snapshot --> TimerCore1
         TimerCore1 --> DAC
     end
 
-    classDef game fill:#1a237e,stroke:#3949ab,stroke-width:2px,color:#ffffff;
-    classDef host fill:#004d40,stroke:#00897b,stroke-width:2px,color:#ffffff;
-    classDef esp fill:#bf360c,stroke:#f4511e,stroke-width:2px,color:#ffffff;
-
-    class GameLoop,SharedMem game;
-    class MapFile,StructMap,Val1,Val2,Val3,Val4,FormatPacket,SerialWrite host;
-    class UARTCore0,EMA,TimerCore1,DAC esp;
+    Python -->|"HPT1 frame"| Bridge
+    AbsHint --> Gate
+    ACCPhysics --> ACCReader
+    Serial -->|"USB-UART"| UARTCore0
 ```
 
 
