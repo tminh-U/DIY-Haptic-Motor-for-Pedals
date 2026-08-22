@@ -39,8 +39,12 @@
 // ==============================================================================
 using namespace std;
 
-const int HZ = 60;
-const auto DURATION = chrono::microseconds(1000000 / HZ);
+const int AC_POLL_HZ = 240;
+const int ACC_POLL_HZ = 60;
+const int SERIAL_HZ = 60;
+const auto AC_POLL_DURATION = chrono::microseconds(1000000 / AC_POLL_HZ);
+const auto ACC_POLL_DURATION = chrono::microseconds(1000000 / ACC_POLL_HZ);
+const auto SERIAL_DURATION = chrono::microseconds(1000000 / SERIAL_HZ);
 const char* PYTHON_SHARED_MEMORY_NAME = "haptic_telemetry_v1";
 const float DEFAULT_ABS_SLIP_RATIO = 0.10f;
 const float DEFAULT_SUSPENSION_MAX_TRAVEL = 0.10f;
@@ -503,6 +507,47 @@ struct LiveData {
     std::atomic<bool>  absActive{false}; // ABS detected via longitudinal SlipRatio + brake
 } g_live;
 
+// The high-rate simulator reader publishes here; the serial sender takes one
+// coherent copy at 60 Hz. Keeping WriteFile off the reader thread prevents a
+// slow USB-UART driver from reducing shared-memory capture frequency.
+struct SerialTelemetryFrame {
+    float absActive = 0.0f;
+    float slipRatioL = 0.0f;
+    float slipRatioR = 0.0f;
+    float roadL = 0.0f;
+    float roadR = 0.0f;
+};
+
+std::mutex g_serialFrameMutex;
+SerialTelemetryFrame g_serialFrame;
+
+void publishSerialFrame(float absActive, float slipRatioL, float slipRatioR,
+                        float roadL, float roadR) {
+    std::lock_guard<std::mutex> lock(g_serialFrameMutex);
+    g_serialFrame = {absActive, slipRatioL, slipRatioR, roadL, roadR};
+}
+
+SerialTelemetryFrame latestSerialFrame() {
+    std::lock_guard<std::mutex> lock(g_serialFrameMutex);
+    return g_serialFrame;
+}
+
+void serialSenderWorker() {
+    auto nextSend = chrono::steady_clock::now();
+    while (isRunning) {
+        nextSend += SERIAL_DURATION;
+        SerialTelemetryFrame frame = latestSerialFrame();
+        sendDataToESP32(frame.absActive, frame.slipRatioL, frame.slipRatioR,
+                        frame.roadL, frame.roadR);
+
+        auto now = chrono::steady_clock::now();
+        if (nextSend < now - SERIAL_DURATION) nextSend = now;
+        std::this_thread::sleep_until(nextSend);
+    }
+
+    sendDataToESP32(0, 0, 0, 0, 0);
+}
+
 int g_prevSerialStatus = -1; // Track previous status to avoid redundant GUI updates
 
 // Enumerate available COM ports from Windows Registry
@@ -615,6 +660,7 @@ void clearLiveTelemetry() {
     g_live.ndSlipL = 0.0f;
     g_live.ndSlipR = 0.0f;
     g_live.absActive = false;
+    publishSerialFrame(0, 0, 0, 0, 0);
 }
 
 // AC uses the in-game Python bridge for physical SlipRatio. ACC publishes
@@ -631,6 +677,12 @@ void telemetryWorker() {
     isConnected = true;
     g_serialStatus = 1;
 
+    // Shared-memory capture is latency-sensitive; serial output has its own
+    // thread and remains at 60 Hz.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    publishSerialFrame(0, 0, 0, 0, 0);
+    std::thread serialSender(serialSenderWorker);
+
     GameKind activeGame = GameKind::None;
     NormalizedTelemetry latest;
     auto lastPacketTime = chrono::steady_clock::now() - chrono::seconds(10);
@@ -638,7 +690,7 @@ void telemetryWorker() {
     auto nextPhysicsRetry = chrono::steady_clock::now();
     auto nextStaticRetry = chrono::steady_clock::now();
     auto nextPythonRetry = chrono::steady_clock::now();
-    auto nextFrame = chrono::steady_clock::now();
+    auto nextPoll = chrono::steady_clock::now();
     auto lastFpsTime = chrono::steady_clock::now();
     int packetCount = 0;
     bool absLatched = false;
@@ -650,7 +702,12 @@ void telemetryWorker() {
     auto previousSuspensionTime = chrono::steady_clock::now();
 
     while (isRunning) {
-        nextFrame += DURATION;
+        // AC's Python bridge is sampled quickly so no acUpdate publication is
+        // missed. ACC retains the original 60 Hz shared-memory polling rate.
+        const auto pollDuration = (activeGame == GameKind::AC)
+            ? AC_POLL_DURATION
+            : ACC_POLL_DURATION;
+        nextPoll += pollDuration;
         auto now = chrono::steady_clock::now();
 
         if (now >= nextGameProbe) {
@@ -697,7 +754,7 @@ void telemetryWorker() {
                 float deltaTime = chrono::duration<float>(now - previousSuspensionTime).count();
                 // Reject session changes and long stalls instead of turning them
                 // into a false full-strength kerb hit.
-                if (deltaTime >= 0.005f && deltaTime <= 0.10f) {
+                if (deltaTime >= 0.001f && deltaTime <= 0.10f) {
                     roadIntensityFL = calculateRoadIntensity(
                         candidate.suspensionFL,
                         previousSuspensionFL,
@@ -737,7 +794,6 @@ void telemetryWorker() {
             roadIntensityFL = 0.0f;
             roadIntensityFR = 0.0f;
             clearLiveTelemetry();
-            sendDataToESP32(0, 0, 0, 0, 0);
         } else {
             g_live.acState = 2;
 
@@ -784,7 +840,7 @@ void telemetryWorker() {
             g_live.susR = roadIntensityFR;
             g_live.absActive = absLatched;
 
-            sendDataToESP32(
+            publishSerialFrame(
                 absLatched ? 1.0f : 0.0f,
                 brakeSlipL,
                 brakeSlipR,
@@ -799,10 +855,12 @@ void telemetryWorker() {
             lastFpsTime = now;
         }
 
-        this_thread::sleep_until(nextFrame);
+        auto loopEnd = chrono::steady_clock::now();
+        if (nextPoll < loopEnd - pollDuration) nextPoll = loopEnd;
+        this_thread::sleep_until(nextPoll);
     }
 
-    sendDataToESP32(0, 0, 0, 0, 0);
+    if (serialSender.joinable()) serialSender.join();
     dismiss(m_pythonTelemetry);
     dismiss(m_static);
     dismiss(m_physics);
@@ -862,7 +920,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(hLblFPS, WM_SETFONT, (WPARAM)hFontStatus, TRUE);
 
             // --- Card 2: Live Telemetry Dashboard ---
-            HWND hTitle2 = CreateWindowA("STATIC", "  AC / ACC Telemetry Bridge (60 Hz)", WS_CHILD | WS_VISIBLE, 20, 150, 460, 22, hWnd, NULL, hInst, NULL);
+            HWND hTitle2 = CreateWindowA("STATIC", "  AC High-rate / ACC 60 Hz / Serial 60 Hz", WS_CHILD | WS_VISIBLE, 20, 150, 460, 22, hWnd, NULL, hInst, NULL);
             SendMessage(hTitle2, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
 
             // Brake

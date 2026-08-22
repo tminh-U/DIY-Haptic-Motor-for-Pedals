@@ -7,14 +7,14 @@ import acsys
 
 SHARED_MEMORY_NAME = "haptic_telemetry_v1"
 SHARED_MEMORY_SIZE = 44
-SEND_INTERVAL = 1.0 / 60.0
 
 _app = 0
 _status_label = 0
 _shared_memory = None
-_accumulator = 0.0
 _sequence = 0
 _last_error = ""
+_status_elapsed = 0.0
+_status_frames = 0
 
 
 def _wheel_values(value):
@@ -39,12 +39,7 @@ def acMain(ac_version):
 
 
 def acUpdate(delta_t):
-    global _accumulator, _sequence, _last_error
-
-    _accumulator += delta_t
-    if _accumulator < SEND_INTERVAL:
-        return
-    _accumulator = _accumulator % SEND_INTERVAL
+    global _sequence, _last_error, _status_elapsed, _status_frames
 
     try:
         brake = float(ac.getCarState(0, acsys.CS.Brake))
@@ -81,7 +76,17 @@ def acUpdate(delta_t):
         if _last_error:
             _last_error = ""
             ac.log("[Haptic Telemetry] stream recovered")
-        ac.setText(_status_label, "Publishing SlipRatio at 60 Hz")
+
+        # Updating an AC UI label for every telemetry frame is surprisingly
+        # expensive. Publish on every acUpdate callback, but refresh this
+        # diagnostic text only once per second.
+        _status_elapsed += delta_t
+        _status_frames += 1
+        if _status_elapsed >= 1.0:
+            measured_hz = int(round(_status_frames / _status_elapsed))
+            ac.setText(_status_label, "Publishing at %d Hz" % measured_hz)
+            _status_elapsed = _status_elapsed % 1.0
+            _status_frames = 0
     except Exception as error:
         message = str(error)
         ac.setText(_status_label, "Telemetry error - check log")
