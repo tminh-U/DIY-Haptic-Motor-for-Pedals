@@ -427,7 +427,7 @@ flowchart TD
 
 ## External / AI-assisted Components
 - Used generative AI extensively to implement the GUI application based on my specifications and system design.
--Used AI to assist with technical documentation, including formalizing mathematical expressions, generating Mermaid diagrams from my system designs, formatting information into tables, and cross-checking technical statements for consistency and accuracy.
+- Used AI to assist with technical documentation, including formalizing mathematical expressions, generating Mermaid diagrams from my system designs, formatting information into tables, and cross-checking technical statements for consistency and accuracy.
 - The ESP32 firmware was primarily written by me, with AI assistance used selectively for debugging and bug-fix patches.
 - Some application-level components were implemented with substantial AI assistance. I understand their role, behavior, and integration within the system, but I did not independently design all of their internal implementation details.
 
