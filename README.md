@@ -289,7 +289,7 @@ The reader checks `packetId` before and after copying a frame to reject torn sha
 Data is formatted as a CSV string and transmitted at **115200 baud, 8-N-1** over USB-UART.
 
 ```text
-absActive,slipRatioFL,slipRatioFR,roadIntensityFL,roadIntensityFR\n
+absVal,slipRatioFL,slipRatioFR,roadIntensityFL,roadIntensityFR\n
 ```
 
 ##### Automatic ESP32 discovery
@@ -341,7 +341,7 @@ The ISR retries at most three times and otherwise reuses its last valid snapshot
 ##### UART data validation : 
 1. `isfinite()` check - Rejects `NaN`, `+Inf`, `-Inf` values that can result from UART byte corruption (e.g., partial packet, electrical noise). This prevents invalid floating-point values from propagating into the waveform synthesis math, where they would cause undefined behavior or crash.
 
-2. Range validation - Rejects packets unless `absActive` is in `0..1`, each longitudinal slip ratio is in `0..2.01`, and each normalized road intensity is in `0..1.001`.
+2. Range validation - Rejects packets unless `absVal` is in `0..1`, each longitudinal slip ratio is in `0..2.01`, and each normalized road intensity is in `0..1.001`.
 
 3. Identity handshake - `ID?` is handled before CSV parsing and returns the immutable ESP32 eFuse MAC with the `HAPTIC_PEDAL,1,` prefix. It does not alter the haptic telemetry or watchdog state.
 

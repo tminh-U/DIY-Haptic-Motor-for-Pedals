@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <tlhelp32.h>
@@ -81,12 +81,12 @@ GameKind detectRunningGame() {
     return GameKind::None;
 }
 
-std::atomic<HANDLE> hSerial{INVALID_HANDLE_VALUE};
-std::atomic<bool> g_pauseSerialWrites{false};
+atomic<HANDLE> hSerial{INVALID_HANDLE_VALUE};
+atomic<bool> g_pauseSerialWrites{false};
 const char* HAPTIC_HANDSHAKE_REQUEST = "ID?\n";
 const char* HAPTIC_HANDSHAKE_PREFIX = "HAPTIC_PEDAL,1,";
 
-std::vector<std::string> getAvailableCOMPorts();
+vector<string> getAvailableCOMPorts();
 
 bool configureSerial(HANDLE serial) {
     DCB dcbSerialParams = { 0 };
@@ -130,7 +130,7 @@ bool readHapticIdentity(HANDLE serial, char* deviceId, size_t deviceIdSize) {
         char chunk[64];
         DWORD bytesRead = 0;
         if (ReadFile(serial, chunk, sizeof(chunk), &bytesRead, NULL) && bytesRead > 0) {
-            size_t toCopy = std::min<size_t>(bytesRead, sizeof(received) - receivedLength - 1);
+            size_t toCopy = min<size_t>(bytesRead, sizeof(received) - receivedLength - 1);
             memcpy(received + receivedLength, chunk, toCopy);
             receivedLength += toCopy;
             received[receivedLength] = '\0';
@@ -151,8 +151,8 @@ bool readHapticIdentity(HANDLE serial, char* deviceId, size_t deviceIdSize) {
     return false;
 }
 
-bool tryOpenHapticPort(const std::string& portName, HANDLE& outSerial, char* deviceId, size_t deviceIdSize) {
-    std::string fullPort = "\\\\.\\" + portName;
+bool tryOpenHapticPort(const string& portName, HANDLE& outSerial, char* deviceId, size_t deviceIdSize) {
+    string fullPort = "\\\\.\\" + portName;
     HANDLE serial = CreateFileA(fullPort.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (serial == INVALID_HANDLE_VALUE) return false;
 
@@ -178,21 +178,21 @@ bool tryOpenHapticPort(const std::string& portName, HANDLE& outSerial, char* dev
 }
 
 bool initSerialAuto(char* portName, size_t portNameSize, char* deviceId, size_t deviceIdSize) {
-    for (const std::string& candidate : getAvailableCOMPorts()) {
+    for (const string& candidate : getAvailableCOMPorts()) {
         HANDLE serial = INVALID_HANDLE_VALUE;
         char foundDeviceId[32] = {};
         if (!tryOpenHapticPort(candidate, serial, foundDeviceId, sizeof(foundDeviceId))) continue;
 
         strncpy_s(portName, portNameSize, candidate.c_str(), _TRUNCATE);
         strncpy_s(deviceId, deviceIdSize, foundDeviceId, _TRUNCATE);
-        hSerial.store(serial, std::memory_order_release);
+        hSerial.store(serial, memory_order_release);
         return true;
     }
     return false;
 }
 
 void closeSerial() {
-    HANDLE serial = hSerial.exchange(INVALID_HANDLE_VALUE, std::memory_order_acq_rel);
+    HANDLE serial = hSerial.exchange(INVALID_HANDLE_VALUE, memory_order_acq_rel);
     if (serial != INVALID_HANDLE_VALUE) {
         CloseHandle(serial);
     }
@@ -278,12 +278,12 @@ bool initPythonTelemetry() {
     return true;
 }
 
-void sendDataToESP32(float absActive, float slipRatioL, float slipRatioR, float roadL, float roadR) {
-    if (g_pauseSerialWrites.load(std::memory_order_acquire)) return;
-    HANDLE serial = hSerial.load(std::memory_order_acquire);
+void sendDataToESP32(float absVal, float slipRatioL, float slipRatioR, float roadL, float roadR) {
+    if (g_pauseSerialWrites.load(memory_order_acquire)) return;
+    HANDLE serial = hSerial.load(memory_order_acquire);
     if (serial == INVALID_HANDLE_VALUE) return;
     char buffer[64];
-    int len = sprintf_s(buffer, "%.2f,%.4f,%.4f,%.4f,%.4f\n", absActive, slipRatioL, slipRatioR, roadL, roadR);
+    int len = sprintf_s(buffer, "%.2f,%.4f,%.4f,%.4f,%.4f\n", absVal, slipRatioL, slipRatioR, roadL, roadR);
     DWORD bytesWritten;
     WriteFile(serial, buffer, len, &bytesWritten, NULL);
 }
@@ -296,23 +296,23 @@ float suspensionMaxTravel(GameKind game, int wheelIndex) {
     float value = (game == GameKind::ACC)
         ? reinterpret_cast<acc::SPageFileStatic*>(m_static.mapFileBuffer)->suspensionMaxTravel[wheelIndex]
         : reinterpret_cast<SPageFileStatic*>(m_static.mapFileBuffer)->suspensionMaxTravel[wheelIndex];
-    return (std::isfinite(value) && value >= 0.01f && value <= 1.0f)
+    return (isfinite(value) && value >= 0.01f && value <= 1.0f)
         ? value
         : DEFAULT_SUSPENSION_MAX_TRAVEL;
 }
 
 float calculateRoadIntensity(float currentTravel, float previousTravel, float maxTravel, float deltaTimeSeconds) {
-    if (!std::isfinite(currentTravel) || !std::isfinite(previousTravel)
-        || !std::isfinite(maxTravel) || !std::isfinite(deltaTimeSeconds)
+    if (!isfinite(currentTravel) || !isfinite(previousTravel)
+        || !isfinite(maxTravel) || !isfinite(deltaTimeSeconds)
         || maxTravel <= 0.0f || deltaTimeSeconds <= 0.0f) {
         return 0.0f;
     }
 
     // Normalized suspension velocity.  A value of 1 means the wheel moved by
     // one full suspension travel per second; larger impacts are saturated.
-    float normalizedRate = std::fabs(currentTravel - previousTravel)
+    float normalizedRate = fabs(currentTravel - previousTravel)
         / (maxTravel * deltaTimeSeconds);
-    return std::clamp(normalizedRate, 0.0f, 1.0f);
+    return clamp(normalizedRate, 0.0f, 1.0f);
 }
 
 struct NormalizedTelemetry {
@@ -330,18 +330,18 @@ struct NormalizedTelemetry {
 };
 
 bool validateTelemetry(const NormalizedTelemetry& parsed) {
-    if (!std::isfinite(parsed.brake) || !std::isfinite(parsed.speedKmh)
-        || !std::isfinite(parsed.slipRatioFL) || !std::isfinite(parsed.slipRatioFR)
-        || !std::isfinite(parsed.ndSlipFL) || !std::isfinite(parsed.ndSlipFR)
-        || !std::isfinite(parsed.suspensionFL) || !std::isfinite(parsed.suspensionFR)) {
+    if (!isfinite(parsed.brake) || !isfinite(parsed.speedKmh)
+        || !isfinite(parsed.slipRatioFL) || !isfinite(parsed.slipRatioFR)
+        || !isfinite(parsed.ndSlipFL) || !isfinite(parsed.ndSlipFR)
+        || !isfinite(parsed.suspensionFL) || !isfinite(parsed.suspensionFR)) {
         return false;
     }
 
     if (parsed.brake < -0.01f || parsed.brake > 1.01f
         || parsed.speedKmh < -5.0f || parsed.speedKmh > 1000.0f
-        || std::fabs(parsed.slipRatioFL) > 10.0f || std::fabs(parsed.slipRatioFR) > 10.0f
-        || std::fabs(parsed.ndSlipFL) > 100.0f || std::fabs(parsed.ndSlipFR) > 100.0f
-        || std::fabs(parsed.suspensionFL) > 2.0f || std::fabs(parsed.suspensionFR) > 2.0f) {
+        || fabs(parsed.slipRatioFL) > 10.0f || fabs(parsed.slipRatioFR) > 10.0f
+        || fabs(parsed.ndSlipFL) > 100.0f || fabs(parsed.ndSlipFR) > 100.0f
+        || fabs(parsed.suspensionFL) > 2.0f || fabs(parsed.suspensionFR) > 2.0f) {
         return false;
     }
 
@@ -427,7 +427,7 @@ bool readAccTelemetry(NormalizedTelemetry& out) {
     MemoryBarrier();
     int packetAfter = shared->packetId;
     if (packetBefore != packetAfter || packetBefore <= 0) return false;
-    if (!std::isfinite(absSignal) || absSignal < -0.01f || absSignal > 1.01f) return false;
+    if (!isfinite(absSignal) || absSignal < -0.01f || absSignal > 1.01f) return false;
 
     parsed.nativeAbsValid = true;
     parsed.nativeAbsActive = (absSignal > 0.5f);
@@ -474,61 +474,60 @@ HBRUSH hBrushInactiveAbs;
 HBRUSH hBrushPanicBg;
 HFONT hFontRegular, hFontBold, hFontTitle, hFontStatus;
 
-std::atomic<bool> isRunning(false);
-std::atomic<bool> isConnected(false);
-std::thread workerThread;
-std::thread serialMonitorThread;
+atomic<bool> isRunning(false);
+atomic<bool> isConnected(false);
+thread workerThread;
+thread serialMonitorThread;
 
 // ESP32 panic detection via serial read
-std::atomic<bool> g_esp32Panicked{false};
-std::atomic<bool> g_panicMsgBoxShown{false};
-std::mutex g_panicMutex;
+atomic<bool> g_esp32Panicked{false};
+atomic<bool> g_panicMsgBoxShown{false};
+mutex g_panicMutex;
 char g_panicMessage[2048] = {0};
 
 // Worker -> GUI thread communication via atomics (no cross-thread GUI calls)
 // 0 = idle, 1 = connected, 2 = serial error, 3 = disconnected, 4 = no matching haptic device
-std::atomic<int> g_serialStatus{0};
+atomic<int> g_serialStatus{0};
 char g_serialPortName[32] = {0};
 char g_hapticDeviceId[32] = {0};
 
 // Live Telemetry Cache for GUI rendering
 struct LiveData {
-    std::atomic<float> brake{0.0f};
-    std::atomic<float> absVal{0.0f};
-    std::atomic<float> slipL{0.0f};
-    std::atomic<float> slipR{0.0f};
-    std::atomic<float> susL{0.0f};
-    std::atomic<float> susR{0.0f};
-    std::atomic<float> ndSlipL{0.0f};
-    std::atomic<float> ndSlipR{0.0f};
-    std::atomic<int>   gameKind{0}; // GameKind value
-    std::atomic<int>   acState{0};  // 0 = closed, 1 = game found/waiting, 2 = telemetry active
-    std::atomic<int>   fps{0};
-    std::atomic<bool>  absActive{false}; // ABS detected via longitudinal SlipRatio + brake
+    atomic<float> brake{0.0f};
+    atomic<float> absVal{0.0f}; // Canonical ABS state: 0.0 inactive, 1.0 active
+    atomic<float> slipL{0.0f};
+    atomic<float> slipR{0.0f};
+    atomic<float> susL{0.0f};
+    atomic<float> susR{0.0f};
+    atomic<float> ndSlipL{0.0f};
+    atomic<float> ndSlipR{0.0f};
+    atomic<int>   gameKind{0}; // GameKind value
+    atomic<int>   acState{0};  // 0 = closed, 1 = game found/waiting, 2 = telemetry active
+    atomic<int>   fps{0};
 } g_live;
 
 // The high-rate simulator reader publishes here; the serial sender takes one
 // coherent copy at 60 Hz. Keeping WriteFile off the reader thread prevents a
 // slow USB-UART driver from reducing shared-memory capture frequency.
 struct SerialTelemetryFrame {
-    float absActive = 0.0f;
+    float absVal = 0.0f;
     float slipRatioL = 0.0f;
     float slipRatioR = 0.0f;
     float roadL = 0.0f;
     float roadR = 0.0f;
 };
 
-std::mutex g_serialFrameMutex;
+mutex g_serialFrameMutex;
 SerialTelemetryFrame g_serialFrame;
 
-void publishSerialFrame(float absActive, float slipRatioL, float slipRatioR,
+void publishSerialFrame(float absVal, float slipRatioL, float slipRatioR,
                         float roadL, float roadR) {
-    std::lock_guard<std::mutex> lock(g_serialFrameMutex);
-    g_serialFrame = {absActive, slipRatioL, slipRatioR, roadL, roadR};
+    lock_guard<mutex> lock(g_serialFrameMutex);
+    g_serialFrame = {absVal, slipRatioL, slipRatioR, roadL, roadR};
 }
 
 SerialTelemetryFrame latestSerialFrame() {
-    std::lock_guard<std::mutex> lock(g_serialFrameMutex);
+    lock_guard<mutex> lock(g_serialFrameMutex);
     return g_serialFrame;
 }
 
@@ -537,12 +536,12 @@ void serialSenderWorker() {
     while (isRunning) {
         nextSend += SERIAL_DURATION;
         SerialTelemetryFrame frame = latestSerialFrame();
-        sendDataToESP32(frame.absActive, frame.slipRatioL, frame.slipRatioR,
+        sendDataToESP32(frame.absVal, frame.slipRatioL, frame.slipRatioR,
                         frame.roadL, frame.roadR);
 
         auto now = chrono::steady_clock::now();
         if (nextSend < now - SERIAL_DURATION) nextSend = now;
-        std::this_thread::sleep_until(nextSend);
+        this_thread::sleep_until(nextSend);
     }
 
     sendDataToESP32(0, 0, 0, 0, 0);
@@ -551,8 +550,8 @@ void serialSenderWorker() {
 int g_prevSerialStatus = -1; // Track previous status to avoid redundant GUI updates
 
 // Enumerate available COM ports from Windows Registry
-std::vector<std::string> getAvailableCOMPorts() {
-    std::vector<std::string> portList;
+vector<string> getAvailableCOMPorts() {
+    vector<string> portList;
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DEVICEMAP\\SERIALCOMM", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         char valueName[256];
@@ -571,8 +570,8 @@ std::vector<std::string> getAvailableCOMPorts() {
     }
     if (portList.empty()) {
         for (int i = 1; i <= 16; i++) {
-            std::string name = "COM" + std::to_string(i);
-            std::string full = "\\\\.\\" + name;
+            string name = "COM" + to_string(i);
+            string full = "\\\\.\\" + name;
             HANDLE h = CreateFileA(full.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
             if (h != INVALID_HANDLE_VALUE) {
                 CloseHandle(h);
@@ -603,9 +602,9 @@ void serialMonitorWorker() {
     int captureLines = 0;
 
     while (isRunning) {
-        HANDLE serial = hSerial.load(std::memory_order_acquire);
+        HANDLE serial = hSerial.load(memory_order_acquire);
         if (serial == INVALID_HANDLE_VALUE) {
-            std::this_thread::sleep_for(chrono::milliseconds(100));
+            this_thread::sleep_for(chrono::milliseconds(100));
             continue;
         }
 
@@ -621,17 +620,17 @@ void serialMonitorWorker() {
                             if (strstr(lineBuf, "Guru Meditation") || strstr(lineBuf, "panic") ||
                                 strstr(lineBuf, "abort()") || strstr(lineBuf, "LoadProhibited") ||
                                 strstr(lineBuf, "StoreProhibited") || strstr(lineBuf, "InstrFetchProhibited")) {
-                                std::lock_guard<std::mutex> lock(g_panicMutex);
+                                lock_guard<mutex> lock(g_panicMutex);
                                 strncpy(g_panicMessage, lineBuf, sizeof(g_panicMessage) - 1);
                                 g_panicMessage[sizeof(g_panicMessage) - 1] = '\0';
-                                g_pauseSerialWrites.store(true, std::memory_order_release);
+                                g_pauseSerialWrites.store(true, memory_order_release);
                                 g_esp32Panicked = true;
                                 isCapturing = true;
                                 captureLines = 0;
                             }
                         } else {
                             if (captureLines < 20) {
-                                std::lock_guard<std::mutex> lock(g_panicMutex);
+                                lock_guard<mutex> lock(g_panicMutex);
                                 strncat(g_panicMessage, "\n", sizeof(g_panicMessage) - strlen(g_panicMessage) - 1);
                                 strncat(g_panicMessage, lineBuf, sizeof(g_panicMessage) - strlen(g_panicMessage) - 1);
                                 captureLines++;
@@ -645,7 +644,7 @@ void serialMonitorWorker() {
             }
         } else {
             // No data available, small sleep to avoid busy-wait
-            std::this_thread::sleep_for(chrono::milliseconds(10));
+            this_thread::sleep_for(chrono::milliseconds(10));
         }
     }
 }
@@ -659,7 +658,6 @@ void clearLiveTelemetry() {
     g_live.susR = 0.0f;
     g_live.ndSlipL = 0.0f;
     g_live.ndSlipR = 0.0f;
-    g_live.absActive = false;
     publishSerialFrame(0, 0, 0, 0, 0);
 }
 
@@ -681,7 +679,7 @@ void telemetryWorker() {
     // thread and remains at 60 Hz.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     publishSerialFrame(0, 0, 0, 0, 0);
-    std::thread serialSender(serialSenderWorker);
+    thread serialSender(serialSenderWorker);
 
     GameKind activeGame = GameKind::None;
     NormalizedTelemetry latest;
@@ -797,23 +795,21 @@ void telemetryWorker() {
         } else {
             g_live.acState = 2;
 
-            float slipL = std::min(std::fabs(latest.slipRatioFL), 2.0f);
-            float slipR = std::min(std::fabs(latest.slipRatioFR), 2.0f);
-            float maxFrontSlip = std::max(slipL, slipR);
+            float slipL = min(fabs(latest.slipRatioFL), 2.0f);
+            float slipR = min(fabs(latest.slipRatioFR), 2.0f);
+            float maxFrontSlip = max(slipL, slipR);
             bool brakeGate = latest.brake > 0.05f && latest.speedKmh > 3.0f;
-            float absConfig = 0.0f;
 
             if (activeGame == GameKind::ACC) {
                 // ACC exposes the real intervention signal; no inferred ABS
                 // threshold is needed for this game.
-                absConfig = latest.nativeAbsActive ? 1.0f : 0.0f;
                 absLatched = brakeGate && latest.nativeAbsValid && latest.nativeAbsActive;
             } else {
                 SPageFilePhysics* pf = reinterpret_cast<SPageFilePhysics*>(m_physics.mapFileBuffer);
-                absConfig = pf ? pf->abs : 0.0f;
-                bool absEnabled = absConfig > 0.001f;
-                float absThreshold = (absConfig >= 0.03f && absConfig <= 0.30f)
-                    ? absConfig
+                float absSlipLimit = pf ? pf->abs : 0.0f;
+                bool absEnabled = absSlipLimit > 0.001f;
+                float absThreshold = (absSlipLimit >= 0.03f && absSlipLimit <= 0.30f)
+                    ? absSlipLimit
                     : DEFAULT_ABS_SLIP_RATIO;
 
                 if (!brakeGate || !absEnabled) {
@@ -829,19 +825,19 @@ void telemetryWorker() {
             // longitudinal front-wheel ratios pass through while braking.
             float brakeSlipL = brakeGate ? slipL : 0.0f;
             float brakeSlipR = brakeGate ? slipR : 0.0f;
+            float absVal = absLatched ? 1.0f : 0.0f;
 
             g_live.brake = latest.brake;
-            g_live.absVal = absConfig;
+            g_live.absVal = absVal;
             g_live.slipL = brakeSlipL;
             g_live.slipR = brakeSlipR;
             g_live.ndSlipL = latest.ndSlipFL;
             g_live.ndSlipR = latest.ndSlipFR;
             g_live.susL = roadIntensityFL;
             g_live.susR = roadIntensityFR;
-            g_live.absActive = absLatched;
 
             publishSerialFrame(
-                absLatched ? 1.0f : 0.0f,
+                absVal,
                 brakeSlipL,
                 brakeSlipR,
                 roadIntensityFL,
@@ -1016,7 +1012,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return (INT_PTR)hBrushCard;
                 }
             } else if (hCtl == hLblAbsStat) {
-                if (g_live.absActive.load()) {
+                if (g_live.absVal.load() >= 0.5f) {
                     SetTextColor(hdc, RGB(255, 255, 255));
                     return (INT_PTR)hBrushActiveAbs;
                 } else {
@@ -1116,8 +1112,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (workerThread.joinable()) workerThread.join();
                     if (serialMonitorThread.joinable()) serialMonitorThread.join();
                     closeSerial();
-                    workerThread = std::thread(telemetryWorker);
-                    serialMonitorThread = std::thread(serialMonitorWorker);
+                    workerThread = thread(telemetryWorker);
+                    serialMonitorThread = thread(serialMonitorWorker);
                 } else {
                     isRunning = false;
                     if (workerThread.joinable()) workerThread.join();
@@ -1210,7 +1206,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SetWindowTextA(hLblBrakeVal, brakeBuf);
 
                 // AC derives ABS from SlipRatio; ACC uses its native `abs` signal.
-                if (g_live.absActive.load()) {
+                if (g_live.absVal.load() >= 0.5f) {
                     SetWindowTextA(hLblAbsStat, ">>> ABS ACTIVE <<<");
                 } else {
                     SetWindowTextA(hLblAbsStat, "  [ OFF ]  ");
@@ -1234,7 +1230,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     char panicBuf[300];
                     char firstLine[200] = {0};
                     {
-                        std::lock_guard<std::mutex> lock(g_panicMutex);
+                        lock_guard<mutex> lock(g_panicMutex);
                         // Extract only the first line for the small UI label
                         const char* newlinePos = strchr(g_panicMessage, '\n');
                         if (newlinePos) {
@@ -1253,7 +1249,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (!g_panicMsgBoxShown.exchange(true)) {
                         char msgBuf[2500];
                         {
-                            std::lock_guard<std::mutex> lock(g_panicMutex);
+                            lock_guard<mutex> lock(g_panicMutex);
                             sprintf_s(msgBuf, sizeof(msgBuf), "ESP32 has crashed (fatal panic)!\n\n%s\n\nPlease reset the ESP32.", g_panicMessage);
                         }
                         MessageBoxA(hWnd, msgBuf, "ESP32 Fatal Panic", MB_ICONERROR);
@@ -1264,10 +1260,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
 
                 // Raw Data Update
-                float absSetting = g_live.absVal.load();
+                float absVal = g_live.absVal.load();
                 char rawBuf[64];
                 sprintf_s(rawBuf, "Brake: %.4f", brake); SetWindowTextA(hLblRawBrake, rawBuf);
-                sprintf_s(rawBuf, "ABS signal: %.4f", absSetting); SetWindowTextA(hLblRawAbs, rawBuf);
+                sprintf_s(rawBuf, "ABS signal: %.4f", absVal); SetWindowTextA(hLblRawAbs, rawBuf);
                 sprintf_s(rawBuf, "Ratio FL: %.4f", slipL); SetWindowTextA(hLblRawSlipL, rawBuf);
                 sprintf_s(rawBuf, "Ratio FR: %.4f", slipR); SetWindowTextA(hLblRawSlipR, rawBuf);
                 sprintf_s(rawBuf, "RoadL: %.4f", susL); SetWindowTextA(hLblRawSusL, rawBuf);
@@ -1317,7 +1313,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         testPacket.suspensionFL = 0.045f;
         testPacket.suspensionFR = 0.046f;
         float roadTest = calculateRoadIntensity(0.051f, 0.050f, 0.10f, 1.0f / 60.0f);
-        return (validateTelemetry(testPacket) && std::fabs(roadTest - 0.60f) < 0.001f) ? 0 : 2;
+        return (validateTelemetry(testPacket) && fabs(roadTest - 0.60f) < 0.001f) ? 0 : 2;
     }
 
     timeBeginPeriod(1);
@@ -1352,3 +1348,4 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     timeEndPeriod(1);
     return (int)msg.wParam;
 }
+
