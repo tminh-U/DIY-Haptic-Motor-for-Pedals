@@ -415,15 +415,18 @@ bool readAccTelemetry(NormalizedTelemetry& out) {
     parsed.slipRatioFR = shared->slipRatio[1];
     parsed.suspensionFL = shared->suspensionTravel[0];
     parsed.suspensionFR = shared->suspensionTravel[1];
-    int absInAction = shared->absInAction;
+    // In ACC the earlier float `abs` is the live intervention signal. The
+    // later `absInAction` member is an unused compatibility field and remains
+    // zero even while the in-game brake indicator shows ABS intervention.
+    float absSignal = shared->abs;
 
     MemoryBarrier();
     int packetAfter = shared->packetId;
     if (packetBefore != packetAfter || packetBefore <= 0) return false;
-    if (absInAction != 0 && absInAction != 1) return false;
+    if (!std::isfinite(absSignal) || absSignal < -0.01f || absSignal > 1.01f) return false;
 
     parsed.nativeAbsValid = true;
-    parsed.nativeAbsActive = (absInAction == 1);
+    parsed.nativeAbsActive = (absSignal > 0.5f);
     if (!validateTelemetry(parsed)) return false;
 
     out = parsed;
@@ -615,7 +618,7 @@ void clearLiveTelemetry() {
 }
 
 // AC uses the in-game Python bridge for physical SlipRatio. ACC publishes
-// SlipRatio and absInAction directly in its extended shared-memory physics page.
+// SlipRatio and the live ABS signal directly in its shared-memory physics page.
 // Both sources are normalized into the same five-field ESP32 packet.
 void telemetryWorker() {
     if (!initSerialAuto(g_serialPortName, sizeof(g_serialPortName), g_hapticDeviceId, sizeof(g_hapticDeviceId))) {
@@ -745,7 +748,7 @@ void telemetryWorker() {
             float absConfig = 0.0f;
 
             if (activeGame == GameKind::ACC) {
-                // ACC exposes the real intervention flag; no inferred ABS
+                // ACC exposes the real intervention signal; no inferred ABS
                 // threshold is needed for this game.
                 absConfig = latest.nativeAbsActive ? 1.0f : 0.0f;
                 absLatched = brakeGate && latest.nativeAbsValid && latest.nativeAbsActive;
@@ -1148,7 +1151,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 sprintf_s(brakeBuf, "%d%%", brakePercent);
                 SetWindowTextA(hLblBrakeVal, brakeBuf);
 
-                // AC derives ABS from SlipRatio; ACC uses absInAction directly.
+                // AC derives ABS from SlipRatio; ACC uses its native `abs` signal.
                 if (g_live.absActive.load()) {
                     SetWindowTextA(hLblAbsStat, ">>> ABS ACTIVE <<<");
                 } else {
