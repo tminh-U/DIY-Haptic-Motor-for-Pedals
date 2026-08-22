@@ -27,7 +27,7 @@ This project is a DIY guide to building a haptic feedback system for sim racing 
 # System architecture
 ```mermaid
 flowchart LR
-    A["Assetto Corsa<br/>Python API"] -->|"Private memory map<br/>60 Hz"| B["get_telemetry.exe"]
+    A["Assetto Corsa<br/>Python API"] -->|"Private memory map<br/>every acUpdate callback"| B["get_telemetry.exe"]
     G["Assetto Corsa Competizione<br/>Shared memory"] -->|"Direct reader<br/>60 Hz"| B
     B -->|Serial| C["ESP32<br/>Waveform Synthesizer"]
     C -->|DAC GPIO 25| D["Amp - Class D<br/>TPA3116D2"]
@@ -58,8 +58,8 @@ flowchart TD
 
 **Pipeline stages:**
 
-1. **AC Python app** - `assetto_corsa_python_app/haptic_telemetry` runs only inside Assetto Corsa and accesses the explicitly named `SlipRatio`, `NdSlip`, and `SuspensionTravel` channels. This avoids interpreting AC's undocumented shared-memory `wheelSlip` field as a physical longitudinal slip ratio.
-2. **ACC direct reader** - no Python app is required. The host reads ACC's `SPageFilePhysics`, using front `slipRatio`, `suspensionTravel`, and the native `abs` intervention signal.
+1. **AC Python app** - `assetto_corsa_python_app/haptic_telemetry` runs only inside Assetto Corsa and publishes on every `acUpdate()` callback. It accesses the explicitly named `SlipRatio`, `NdSlip`, and `SuspensionTravel` channels, avoiding interpretation of AC's undocumented shared-memory `wheelSlip` field as a physical longitudinal slip ratio. The callback rate is controlled by AC and is not necessarily equal to rendered FPS.
+2. **ACC direct reader** - no Python app is required. The host polls ACC's `SPageFilePhysics` at 60 Hz, using front `slipRatio`, `suspensionTravel`, and the native `abs` intervention signal. Serial output runs independently at 60 Hz, so USB writes cannot stall shared-memory capture.
 3. **`get_telemetry.exe`** - automatically detects AC or ACC, validates coherent frames, gates longitudinal slip to braking above 3 km/h, and normalizes road input. `acpmf_static.suspensionMaxTravel` is used when valid; otherwise the road calculation falls back to `0.10 m`.
 4. **ESP32** - receives the relevant values over serial, applies the effect logic (priority, weighting, carrier-modulation as described in Design Rationale), and continuously synthesizes a waveform sample-by-sample, output through its internal DAC.
 5. **Class D amp (TPA3116D2)** - amplifies the low-power DAC signal enough to drive the exciter.
@@ -252,9 +252,9 @@ For **Assetto Corsa**:
 1. Copy `assetto_corsa_python_app/haptic_telemetry` to `<Assetto Corsa>/apps/python/haptic_telemetry`.
 2. Enable **Haptic Telemetry** in Assetto Corsa or Content Manager's Python Apps settings.
 3. Start a driving session, run `get_telemetry.exe`, and click **CONNECT**. The app scans the available COM ports and connects only to the ESP32 that identifies itself as a haptic controller.
-4. Confirm that the GUI shows `ESP32: [AUTO CONNECTED] COMx - <device ID>`, `AC Python API: [RECEIVING]`, and a stream rate close to 60 Hz.
+4. Confirm that the GUI shows `ESP32: [AUTO CONNECTED] COMx - <device ID>` and `AC Python API: [RECEIVING]`. `Stream` reports AC's actual Python `acUpdate()` callback rate; serial output to the ESP32 remains fixed at 60 Hz.
 
-For **Assetto Corsa Competizione**, no Python app or UDP configuration is required. Start a driving session, open `get_telemetry.exe`, and connect the ESP32. The GUI should show `ACC Shared Memory: [RECEIVING]`.
+For **Assetto Corsa Competizione**, no Python app or UDP configuration is required. Start a driving session, open `get_telemetry.exe`, and connect the ESP32. The GUI should show `ACC Shared Memory: [RECEIVING]`. The displayed Stream value counts distinct valid simulator packets captured by the 60 Hz reader; it is not the game's rendered FPS.
 
 The host automatically distinguishes `acs.exe` from `AC2-Win64-Shipping.exe`/`acc.exe`. If either telemetry source stops for more than 250 ms, the PC app sends zeros to silence the motor. The ESP32 independently silences its output after 500 ms without a valid serial packet.
 
@@ -375,10 +375,10 @@ flowchart TD
     end
 
     subgraph Host ["2. get_telemetry.exe"]
-        Bridge["Private memory-map reader\nhaptic_telemetry_v1 @ 60 Hz"]
-        ACCReader["ACC direct reader\npacketId coherence check"]
+        Bridge["Private memory-map reader\nhaptic_telemetry_v1 @ AC callback rate"]
+        ACCReader["ACC direct reader @ 60 Hz\npacketId coherence check"]
         Gate["Slip gate + normalized road formula\nUse longitudinal SlipRatio only"]
-        Serial["CSV serial output\n115200 baud"]
+        Serial["Independent CSV serial output @ 60 Hz\n115200 baud"]
         Bridge --> Gate --> Serial
         ACCReader --> Gate
     end
