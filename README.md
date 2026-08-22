@@ -172,7 +172,7 @@ The input is the physical longitudinal slip ratio: the Python API's `SlipRatio` 
 $$
 \begin{aligned}
 \text{Slip}_{\text{front}}(t) &= \max\Big(\text{slipL}(t), \ \text{slipR}(t)\Big) \\
-\text{DAC}_{\text{slip}}(t)   &= 128 + A_{\text{slip}}(t) \cdot \sin(2\pi \cdot 45 \cdot t)
+\text{DAC}_{\text{slip}}(t)   &= 128 + A_{\text{slip}}(t) \cdot \sin(2\pi \cdot rand(50, 90) \cdot t)
 \end{aligned}
 $$
 
@@ -351,7 +351,7 @@ The ISR retries at most three times and otherwise reuses its last valid snapshot
 2. LED OFF (RED): Set `LOW` when no valid packet has been received for $> 500\text{ms}$, indicating USB disconnection or data loss. The watchdog also zeros all shared variables to silence the motor
 
 ##### Performance and resources :
-1. Core 0 utilizes less than 0.2% and Core 1 utilizes less than 0.75% of CPU capacity, reducing latency and performance overhead to nearly 0%.
+1. The firmware is lightweight and uses only a small amount of RAM for telemetry state, lookup tables, and global variables.
 2. Memory usage is minimal, with only a few kilobytes of RAM used for storing telemetry data and global variables.
 3. Although sinf(x) is O(1) time complexity, using it still costs a lot of CPU resources and time to solve, so a LUT (Look-up table) is used to reduce the CPU usage and calculation time. Also, when using a high sample rate such as 16000Hz, using the sinf(x) function may cause floating point errors and return incorrect data. Therefore, using LUT is more stable and efficient for generating waveforms. LUT formula : the circle is divided into 1024 parts, so the angle will be : $\theta = 2\pi \cdot \frac{i}{1024}$, so $\sin \theta = \sin(2\pi \cdot \frac{i}{1024})$ where $i$ is the index of the LUT. And a sine wave step after a single sampling is calculated by $\frac{\text{frequency} \times 1024}{\text{sample rate}}$. For example, ABS at 60Hz with 16000Hz sample rate : $\frac{60 \times 1024}{16000} = 3.84$.
 
@@ -417,16 +417,17 @@ flowchart TD
 - Designed the overall PC-to-ESP32 telemetry pipeline.
 - Developed the haptic response and mapping logic.
 - Tuned and validated the haptic response.
-- Designed ESP32 architectutre :
-1. separating time-critical control from communication and background tasks.
-2. Using hardware timers for deterministic timing.
+- Designed ESP32 architecture :
+1. separated time-critical control from communication and background tasks.
+2. Used hardware timers for deterministic timing.
+- Implemented most of the ESP32 firmware, including the telemetry receiver, waveform synthesis, effect logic, and hardware-timer-based control loop.
 - Wrote the CLI prototype for get_telemetry app.
 - Integrated and tested the system on sim-racing pedals.
-- Writing project documentation.
+- Wrote this project documentation.
 
 ## External / AI-assisted Components
 - Used generative AI extensively to implement the GUI application based on my specifications and system design.
-- Used AI to assist with technical documentation, including formalizing mathematical expressions, generating Mermaid diagrams from my system designs, and formatting information into tables.
-- Used AI tools selectively for debugging difficult firmware/runtime issues.
-- Some non-core application components were implemented with substantial AI assistance. I understand their role, behavior, and integration within the system, but I did not independently design all of their internal implementation details.
+-Used AI to assist with technical documentation, including formalizing mathematical expressions, generating Mermaid diagrams from my system designs, formatting information into tables, and cross-checking technical statements for consistency and accuracy.
+- The ESP32 firmware was primarily written by me, with AI assistance used selectively for debugging and bug-fix patches.
+- Some application-level components were implemented with substantial AI assistance. I understand their role, behavior, and integration within the system, but I did not independently design all of their internal implementation details.
 
