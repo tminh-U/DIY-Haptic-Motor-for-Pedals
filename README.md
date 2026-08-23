@@ -264,7 +264,10 @@ Because 4 ohm is the exciter's nominal impedance and its actual impedance varies
 
 For this exact hardware configuration, the calibrated continuous-output safety limit is:
 
-$$\text{MASTER\_GAIN} \le 0.80, \qquad V_{\text{OUT}} \le 6.1\text{ Vrms at 60 Hz}$$
+$$
+G_{\mathrm{master}} \le 0.80, \qquad
+V_{\mathrm{OUT}} \le 6.1\,\mathrm{V_{RMS}}\quad\text{at 60 Hz}
+$$
 
 This corresponds to approximately 9.3 W using the nominal 4-ohm value. The 25 W marking is not used as a continuous sine-wave target: the exciter becomes noticeably warm during sustained resonant operation, and its exact continuous thermal rating is not documented. The amplifier board's advertised 100 W figure also does not apply to this 12 V / 3 A supply configuration.
 
