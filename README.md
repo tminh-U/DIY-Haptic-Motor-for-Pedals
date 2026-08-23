@@ -7,7 +7,7 @@ This project is a DIY guide to building a haptic feedback system for sim racing 
 
 
 
-# Existing solutions & why a custom approach
+# Existing solutions and why a custom approach
 
 | Criteria | Eccentric motor (ERM) | Soundcard + bass shaker | This project (ESP32 + exciter) |
 |---|---|---|---|
@@ -37,13 +37,13 @@ flowchart LR
 - **Signal path** - Assetto Corsa uses the bundled Python app to publish physical `SlipRatio` and suspension data through `haptic_telemetry_v1`. Assetto Corsa Competizione needs no Python app: `get_telemetry.exe` reads its extended shared-memory physics page directly. Both paths are normalized to the same five-field serial packet, and the ESP32 synthesizes waveforms at 16 kHz through its internal DAC (GPIO 25).
 
 
-# Supported features :
+# Supported features
 - **Supported games** - Assetto Corsa (Python telemetry bridge) and Assetto Corsa Competizione (direct shared memory, automatically detected).
 - **ABS Feedback** -- When ABS intervenes, it pulses the brakes rapidly via a hydraulic modulator to prevent wheel lock-up. This causes the pedal to judder/vibrate.
 - **Lock-up / Tire Slip** -- When the car locks up or the tires slip, kinetic friction between the tires and the road generates vibration that travels back through the suspension and chassis to the seat and pedals. To simplify this effect, this motor simulates a similar vibration pattern to what is felt at the seat, but at a weaker intensity.
 - **Road Effect** - When the front tires hit a kerb, gravel, or debris, the impact vibration travels back through the pedals in a real car. This system derives that sensation from the normalized vertical speed of the front suspension.
 
-# Design rationale & control logic
+# Design rationale and control logic
 
 
 ```mermaid
@@ -67,7 +67,7 @@ flowchart TD
 
 
 
-### Telemetry Pre-processing: Signal Smoothing (LERP vs. EMA)
+## Telemetry pre-processing: signal smoothing (LERP vs. EMA)
 
 To prevent harsh, stepped vibrations caused by frame-to-frame telemetry updates, raw telemetry values are smoothed before generating waveforms:
 
@@ -96,7 +96,7 @@ Where:
 - $\alpha = 0.01131$: Smoothing factor calibrated for $95\%$ convergence within one 60 Hz telemetry frame.
 
 
-#### Step Response Over 266 Interrupt Cycles ($0 \rightarrow 100\%$ Step):
+### Step response over 266 interrupt cycles ($0 \rightarrow 100\%$ step)
 
 
 | Interrupt Step ($n$) | Elapsed Time ($t$) | Amplitude ($y[n]$) | Physical / Tactile Behavior |
@@ -118,7 +118,7 @@ After analyzing various $\alpha$ values, $\alpha = 0.01131$ was chosen because i
 **[21/8/2026 Update - Fixing floating point]**
 - When using EMA smoothing with a very small $\Delta$ (where $\Delta = |\text{Target}[n] - y[n-1]|$), it may cause ESP32 fatal panics, so the $\Delta$ is limited to $\Delta \ge 10^{-4}$.
 
-### How all of the effects are calculated in this module:
+## Effect calculations
 1. **ABS:** In real life, ABS pulse is caused by the hydraulic modulator releasing and reapplying brake pressure rapidly 10–15 times per second (Bosch Automotive Handbook), so the frequency is set to 12 Hz, which is the sweet spot for ABS. Because sound exciters have poor low-frequency response at 12 Hz, Amplitude Modulation (AM) is used - modulating a 60 Hz carrier wave with a 12 Hz sine envelope to maximize tactile feedback strength while preserving the realistic frequency. Since `absVal` is a boolean telemetry flag (0 or 1), driver brake pedal pressure (`brakeVal`) is used to scale the vibration amplitude dynamically:
 
 ~~$$y_{\text{carrier}}(t) = \sin(2\pi \cdot 60 \cdot t)$$~~
@@ -190,7 +190,7 @@ $$
 
 **Note :** 50Hz and 90Hz is the chosen frequency based on previous sim racing DIY builders' experience and physical testing. The sine wave frequency is randomized by `xorshift32()` function.
 
-### Tire Slip Mapping & Perception Breakdown:
+## Tire slip mapping and perception breakdown
 
 | Slip Value ($\text{Slip}_{\text{front}}$) | State | Amplitude | Tactile feedback |
 |---|---|---|---|
@@ -201,26 +201,32 @@ $$
 | **$\text{Slip} > 1.00$** | Clamped extreme input | **85** | Maximum output without telemetry spikes consuming headroom. |
 
 
-### Signal Mixing & Headroom Management
+## Signal mixing and headroom management
 
-When all 3 effects happen at the same time (e.g. braking hard (ABS) while hitting a bump (Road effect) while on a slippery surface (Tire slip)), the amplitudes of the 3 effects will add together :
-    $$y_{\text{total}}(t) = y_{\text{ABS}}(t) + y_{\text{Slip}}(t) + y_{\text{Road}}(t)$$
+When multiple effects happen at the same time (for example, braking under ABS while crossing a kerb), their instantaneous samples are added:
 
-So, to prevent the signal from clipping and disorting, a weighted system using a LUT (look-up table) is applied :
+$$y_{\text{total}}(t) = y_{\text{ABS}}(t) + y_{\text{Road}}(t) + y_{\text{Slip}}(t)$$
 
-| State (Bit 2,1,0) | Active Effects | ABS Weight | Road Weight | Slip Weight | Total Weight |
-| :---: | :--- | :---: | :---: | :---: | :---: |
-| `000` | None | `0.00` | `0.00` | `0.00` | `0.00` |
-| `001` | ABS only | `1.00 * H_M` | `0.00` | `0.00` | `1.00 * H_M` |
-| `010` | Road only | `0.00` | `1.00 * H_M` | `0.00` | `1.00 * H_M` |
-| `011` | ABS + Road | `0.75 * H_M` | `0.25 * H_M` | `0.00` | `1.00 * H_M` |
-| `100` | Slip only | `0.00` | `0.00` | `1.00 * H_M` | `1.00 * H_M` |
-| `101` | ABS + Slip | `0.85 * H_M` | `0.00` | `0.15 * H_M` | `1.00 * H_M` |
-| `110` | Road + Slip | `0.00` | `0.35 * H_M` | `0.65 * H_M` | `1.00 * H_M` |
-| `111` | ABS + Road + Slip | `0.60 * H_M` | `0.25 * H_M` | `0.15 * H_M` | `1.00 * H_M` |
+Each effect has a different native maximum amplitude, so the firmware uses one normalization factor per effect instead of a single shared headroom multiplier:
 
-Where the Headroom Multiplier ($H_M$) is calculated as:
-$$H_M = \frac{\text{Max DAC Amplitude}}{\text{Max ABS} + \text{Max Road} + \text{Max Slip}} = \frac{127}{120 + 70 + 85} \approx 0.4618$$
+$$w_{\text{ABS}} = \frac{1}{120}, \qquad
+w_{\text{Road}} = \frac{1}{70}, \qquad
+w_{\text{Slip}} = \frac{1}{85}$$
+
+The values below are the intended peak DAC-amplitude allocations. The lookup table stores each allocation multiplied by its corresponding normalization factor; for example, an ABS allocation of 85 is stored as $85 \cdot w_{\text{ABS}}$, so the original 120-count ABS waveform contributes at most 85 counts.
+
+| State (bits 2,1,0) | Active effects | ABS allocation | Road allocation | Slip allocation | Maximum sum |
+| :---: | :--- | ---: | ---: | ---: | ---: |
+| `000` | None | 0 | 0 | 0 | 0 |
+| `001` | ABS only | 120 | 0 | 0 | 120 |
+| `010` | Road only | 0 | 70 | 0 | 70 |
+| `011` | ABS + Road | 85 | 40 | 0 | 125 |
+| `100` | Slip only | 0 | 0 | 85 | 85 |
+| `101` | ABS + Slip | 90 | 0 | 35 | 125 |
+| `110` | Road + Slip | 0 | 50 | 75 | 125 |
+| `111` | ABS + Road + Slip | 75 | 30 | 20 | 125 |
+
+The ESP32 DAC is centered at 128 and has 127 counts of usable peak headroom. Every combined-effect row is therefore limited to 125 counts, leaving a two-count margin before clipping. The actual instantaneous sum is normally lower because the 60 Hz ABS carrier, 75 Hz road waveform, and randomized 50/90 Hz slip waveform do not generally reach their peaks at the same time.
 
 
 # Hardware implementation
@@ -233,19 +239,52 @@ $$H_M = \frac{\text{Max DAC Amplitude}}{\text{Max ABS} + \text{Max Road} + \text
 **Note:** The selected exciter has a rated frequency response of ~60Hz–20kHz (resonance frequency 60Hz ±20%), with SPL relatively stable between 20–150Hz and a dip around 300Hz–1kHz. Since target effects (e.g. ABS pulsing at 10–15Hz) fall below the exciter's effective operating range, a carrier-modulation approach was used instead of direct low-frequency playback (see Design Rationale).
 
 
+## Calibrated operating limit
+
+The output limit below was measured on the assembled system, not inferred from the amplifier's advertised maximum power:
+
+- Amplifier board: XH-M542 / TPA3116D2 mono
+- Power supply: 12 V DC, 3 A
+- Exciter: nominal 4 ohm, marked 25 W
+- Calibration signal: continuous 60 Hz sine wave
+- Amplifier volume: maximum and unchanged between measurements
+- Measurement point: directly across `OUT+` and `OUT-`, with the exciter connected
+
+| Master gain | Measured output | Estimated power into nominal 4 ohm |
+| ---: | ---: | ---: |
+| `0.50` | 3.6 Vrms | 3.2 W |
+| `0.70` | 5.2 Vrms | 6.8 W |
+| `0.80` | 6.0-6.1 Vrms | 9.0-9.3 W |
+
+The power estimates use:
+
+$$P \approx \frac{V_{\text{RMS}}^2}{R}$$
+
+Because 4 ohm is the exciter's nominal impedance and its actual impedance varies with frequency, these values are engineering estimates rather than laboratory power measurements.
+
+For this exact hardware configuration, the calibrated continuous-output safety limit is:
+
+$$\text{MASTER\_GAIN} \le 0.80, \qquad V_{\text{OUT}} \le 6.1\text{ Vrms at 60 Hz}$$
+
+This corresponds to approximately 9.3 W using the nominal 4-ohm value. The 25 W marking is not used as a continuous sine-wave target: the exciter becomes noticeably warm during sustained resonant operation, and its exact continuous thermal rating is not documented. The amplifier board's advertised 100 W figure also does not apply to this 12 V / 3 A supply configuration.
+
+The continuous 60 Hz calibration tone is a more severe thermal load than normal firmware output, where ABS is pulse-gated and multiple effects do not remain at their maximum allocations continuously. Even so, long-duration testing must be supervised. Stop immediately if temperature continues rising without stabilizing, vibration becomes distorted, or there is any smell from the coil, adhesive, wiring, or amplifier.
+
+The TPA3116D2 output is BTL. Voltage must be measured between `OUT+` and `OUT-`; neither speaker terminal may be connected to ESP32 ground, USB ground, or power-supply ground. Attach meter probes with power off, select AC voltage mode, and never use resistance or current mode on an energized output.
+
 ![enter image description here](https://i.ibb.co/dwx0Mhwz/04265e6525c9a497fdd8.jpg)
 ![enter image description here](https://i.ibb.co/hR8XRgNH/ab7225315e9ddfc3868c.jpg)
 
 # Firmware/software implementation
 
 
-### Software :
+## Software
 - GUI version : get_telemetry.exe
 
 
 - C++ was used for best performance and reduce packet loss or late data transfer when sending the game telemetry data to ESP32
 
-##### Installation and startup
+### Installation and startup
 
 For **Assetto Corsa**:
 
@@ -259,7 +298,7 @@ For **Assetto Corsa Competizione**, no Python app or UDP configuration is requir
 The host automatically distinguishes `acs.exe` from `AC2-Win64-Shipping.exe`/`acc.exe`. If either telemetry source stops for more than 250 ms, the PC app sends zeros to silence the motor. The ESP32 independently silences its output after 500 ms without a valid serial packet.
 
 
-##### Assetto Corsa Python API bridge
+### Assetto Corsa Python API bridge
 Install `assetto_corsa_python_app/haptic_telemetry` into Assetto Corsa's `apps/python` directory and enable **Haptic Telemetry**. The in-game app publishes the following `HPT1` fields through `haptic_telemetry_v1`:
 
 | Field | Source | Usage |
@@ -272,7 +311,7 @@ Install `assetto_corsa_python_app/haptic_telemetry` into Assetto Corsa's `apps/p
 
 `get_telemetry.exe` opens `Local\acpmf_physics` only for the ABS enabled/configuration hint and `Local\acpmf_static` for `suspensionMaxTravel`. It does not read shared-memory `wheelSlip` for haptic output.
 
-##### Assetto Corsa Competizione direct bridge
+### Assetto Corsa Competizione direct bridge
 
 ACC is read directly from its extended `Local\acpmf_physics` page using the layout in `get_telemetry/structed_file_ACC.h`:
 
@@ -285,14 +324,14 @@ ACC is read directly from its extended `Local\acpmf_physics` page using the layo
 
 The reader checks `packetId` before and after copying a frame to reject torn shared-memory reads. ACC's legacy `wheelSlip` and unused `absInAction` fields are not used for haptic activation.
 
-##### Serial Protocol
+### Serial protocol
 Data is formatted as a CSV string and transmitted at **115200 baud, 8-N-1** over USB-UART.
 
 ```text
 absVal,slipRatioFL,slipRatioFR,roadIntensityFL,roadIntensityFR\n
 ```
 
-##### Automatic ESP32 discovery
+### Automatic ESP32 discovery
 
 The ESP32 has a stable eFuse MAC identifier. On every connection attempt, the PC app opens each available COM port with DTR/RTS disabled, sends the following request, and keeps only the port that returns the expected protocol prefix:
 
@@ -306,16 +345,16 @@ For example, `HAPTIC_PEDAL,1,00C4D2BD2A58` is a valid wire response. This means 
 
 
 
-### Firmware :
+## Firmware
 
-##### Dual-core architecture: 
+### Dual-core architecture
 1. **Core 0 - UART receiver:** The `serial_read` task initializes `Serial` and receives telemetry packets. Initializing the UART driver from this pinned task allocates its UART interrupt on Core 0, then publishes a coherent telemetry snapshot for the waveform engine.
 2. **Core 1 - waveform engine:** `setup()` creates the GPTimer on Core 1. Its 16 kHz ISR generates ABS, slip, and road waveforms, then writes the DAC output on GPIO 25.
 
 Keeping the UART ISR on Core 0 and the GPTimer ISR on Core 1 prevents the high-rate timer callback from competing with UART receive interrupts on the same shared interrupt path when the PC starts streaming telemetry.
 
 
-##### Lock-free telemetry snapshot:
+### Lock-free telemetry snapshot
 
 Three `volatile float` values (`cur_absVal`, `road_intensity`, `cur_slip`) are shared between the Core 0 serial task and the Core 1 timer ISR. A single-writer sequence lock keeps the three values in one coherent snapshot without taking another `portMUX` from inside the GPTimer shared interrupt handler.
 
@@ -338,7 +377,7 @@ uint32_t after  = __atomic_load_n(&telemetry_sequence, __ATOMIC_SEQ_CST);
 The ISR retries at most three times and otherwise reuses its last valid snapshot, so it cannot spin indefinitely. This removes nested spinlock operations while retaining a 62.5 microsecond ISR period (16 kHz).
 
 
-##### UART data validation : 
+### UART data validation
 1. `isfinite()` check - Rejects `NaN`, `+Inf`, `-Inf` values that can result from UART byte corruption (e.g., partial packet, electrical noise). This prevents invalid floating-point values from propagating into the waveform synthesis math, where they would cause undefined behavior or crash.
 
 2. Range validation - Rejects packets unless `absVal` is in `0..1`, each longitudinal slip ratio is in `0..2.01`, and each normalized road intensity is in `0..1.001`.
@@ -346,11 +385,11 @@ The ISR retries at most three times and otherwise reuses its last valid snapshot
 3. Identity handshake - `ID?` is handled before CSV parsing and returns the immutable ESP32 eFuse MAC with the `HAPTIC_PEDAL,1,` prefix. It does not alter the haptic telemetry or watchdog state.
 
 
-##### Status indicator and Watchdog
+### Status indicator and watchdog
 1. LED ON (GREEN): Set `HIGH` when a valid, fully-parsed 5-field packet passes both validation checks.
 2. LED OFF (RED): Set `LOW` when no valid packet has been received for $> 500\text{ms}$, indicating USB disconnection or data loss. The watchdog also zeros all shared variables to silence the motor
 
-##### Performance and resources :
+### Performance and resources
 1. The firmware is lightweight and uses only a small amount of RAM for telemetry state, lookup tables, and global variables.
 2. Memory usage is minimal, with only a few kilobytes of RAM used for storing telemetry data and global variables.
 3. Although sinf(x) is O(1) time complexity, using it still costs a lot of CPU resources and time to solve, so a LUT (Look-up table) is used to reduce the CPU usage and calculation time. Also, when using a high sample rate such as 16000Hz, using the sinf(x) function may cause floating point errors and return incorrect data. Therefore, using LUT is more stable and efficient for generating waveforms. LUT formula : the circle is divided into 1024 parts, so the angle will be : $\theta = 2\pi \cdot \frac{i}{1024}$, so $\sin \theta = \sin(2\pi \cdot \frac{i}{1024})$ where $i$ is the index of the LUT. And a sine wave step after a single sampling is calculated by $\frac{\text{frequency} \times 1024}{\text{sample rate}}$. For example, ABS at 60Hz with 16000Hz sample rate : $\frac{60 \times 1024}{16000} = 3.84$.
@@ -358,7 +397,7 @@ The ISR retries at most three times and otherwise reuses its last valid snapshot
 4. Because the hardware timer interrupt runs from internal RAM (`IRAM_ATTR`), using `<cmath>` library functions (like `fminf`, `fabsf`, `fmaxf`, etc.) can cause the ESP32 to crash. These functions are stored in external SPI Flash, and accessing them during an interrupt when the flash cache is disabled will result in a fatal panic. Therefore, basic conditional statements are used instead.
 
 
-### How it works :
+## How it works
 
 ```mermaid
 flowchart TD
@@ -399,12 +438,12 @@ flowchart TD
 ```
 
 
-# Results/Demo
+# Results and demo
 
 **See here :** [BUILD_LOG.md](BUILD_LOG.md)
 
 
-# Academic & Technical References
+# Academic and technical references
 
 1. **ABS Hydraulic Cycling Benchmark (10–15 Hz):**
    - **Bosch Automotive Handbook (10th Edition).** Robert Bosch GmbH. "Antilock Braking Systems (ABS) - Hydraulic Valve Modulation and Pressure Cycling".
@@ -422,10 +461,11 @@ flowchart TD
 2. Used hardware timers for deterministic timing.
 - Implemented most of the ESP32 firmware, including the telemetry receiver, waveform synthesis, effect logic, and hardware-timer-based control loop.
 - Wrote the CLI prototype for get_telemetry app.
+- Calculated and calibrated the power and output limit.
 - Integrated and tested the system on sim-racing pedals.
 - Wrote this project documentation.
 
-## External / AI-assisted Components
+## External and AI-assisted components
 - Used generative AI extensively to implement the GUI application based on my specifications and system design.
 - Used AI to assist with technical documentation, including formalizing mathematical expressions, generating Mermaid diagrams from my system designs, formatting information into tables, and cross-checking technical statements for consistency and accuracy.
 - The ESP32 firmware was primarily written by me, with AI assistance used selectively for debugging and bug-fix patches.

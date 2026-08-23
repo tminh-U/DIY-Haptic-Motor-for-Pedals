@@ -112,18 +112,21 @@ DRAM_ATTR float curg_absVal = 0.0f, curg_slip = 0.0f, curg_road_intensity = 0.0f
 
 
 
-#define H_M (127.0f / (120.0f + 85.0f + 70.0f))
+
+#define abs_w (1.0f / 120.0f)
+#define road_w (1.0f / 70.0f)
+#define slip_w (1.0f / 85.0f)
 
 DRAM_ATTR weightmp mp[8] = {
-    //ABS(bit0)         Road(bit1)        Slip(bit2)
-   { 0.00f * H_M,      0.00f * H_M,      0.00f * H_M },
-   { 1.00f * H_M,      0.00f * H_M,      0.00f * H_M },
-   { 0.00f * H_M,      1.00f * H_M,      0.00f * H_M },
-   { 0.75f * H_M,      0.25f * H_M,      0.00f * H_M },
-   { 0.00f * H_M,      0.00f * H_M,      1.00f * H_M },
-   { 0.85f * H_M,      0.00f * H_M,      0.15f * H_M },
-   { 0.00f * H_M,      0.35f * H_M,      0.65f * H_M },
-   { 0.60f * H_M,      0.25f * H_M,      0.15f * H_M }
+    // ABS(bit0)          Road(bit1)         Slip(bit2)
+    {   0.0f * abs_w,      0.0f * road_w,     0.0f * slip_w },
+    { 120.0f * abs_w,      0.0f * road_w,     0.0f * slip_w },
+    {   0.0f * abs_w,     70.0f * road_w,     0.0f * slip_w },
+    {  85.0f * abs_w,     40.0f * road_w,     0.0f * slip_w },
+    {   0.0f * abs_w,      0.0f * road_w,    85.0f * slip_w },
+    {  90.0f * abs_w,      0.0f * road_w,    35.0f * slip_w },
+    {   0.0f * abs_w,     50.0f * road_w,    75.0f * slip_w },
+    {  75.0f * abs_w,     30.0f * road_w,    20.0f * slip_w }
 };
 
 
@@ -140,6 +143,7 @@ __attribute__((always_inline)) weightmp Mix(volatile float abs, volatile float s
 #define LUT_SIZE 1024
 
 DRAM_ATTR uint16_t t_abs = 0;
+#define MASTER_GAIN 0.80f
 #define step_abs   ((60.0f * LUT_SIZE) / SAMPLE_RATE)
 #define step_slipA ((50.0f * LUT_SIZE) / SAMPLE_RATE)
 #define step_slipB ((90.0f * LUT_SIZE) / SAMPLE_RATE)
@@ -242,7 +246,7 @@ void IRAM_ATTR calc_effect() {
     }
     float slip_effect = a_slip * LUT[int(phase_slip) & 1023] * curg_weight_slip;
 
-    float total = 128 + (abs_effect + road_effect + slip_effect);
+    float total = 128 + (abs_effect + road_effect + slip_effect) * MASTER_GAIN;
     total = (total > 0.0f ? total : 0);
     total = (total < 255.0f ? total : 255.0f);
     SET_PERI_REG_BITS(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_DAC, (uint8_t)total, RTC_IO_PDAC1_DAC_S);
