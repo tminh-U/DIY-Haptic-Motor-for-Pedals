@@ -114,14 +114,14 @@ DRAM_ATTR float curg_absVal = 0.0f, curg_slip = 0.0f, curg_road_intensity = 0.0f
 
 
 #define abs_w (1.0f / 120.0f)
-#define road_w (1.0f / 70.0f)
+#define road_w (1.0f / 65.0f)
 #define slip_w (1.0f / 85.0f)
 
 DRAM_ATTR weightmp mp[8] = {
     // ABS(bit0)          Road(bit1)         Slip(bit2)
     {   0.0f * abs_w,      0.0f * road_w,     0.0f * slip_w },
     { 120.0f * abs_w,      0.0f * road_w,     0.0f * slip_w },
-    {   0.0f * abs_w,     70.0f * road_w,     0.0f * slip_w },
+    {   0.0f * abs_w,     65.0f * road_w,     0.0f * slip_w },
     {  85.0f * abs_w,     40.0f * road_w,     0.0f * slip_w },
     {   0.0f * abs_w,      0.0f * road_w,    85.0f * slip_w },
     {  90.0f * abs_w,      0.0f * road_w,    35.0f * slip_w },
@@ -225,8 +225,8 @@ void IRAM_ATTR calc_effect() {
 
     // Road effect: the PC has already calculated and clamped normalized
     // suspension velocity to 0..1 using each car's suspensionMaxTravel.
-    float a_road = curg_road_intensity * 70.0f;
-    a_road = (a_road < 70.0f ? a_road : 70.0f);
+    float a_road = curg_road_intensity * 65.0f;
+    a_road = (a_road < 65.0f ? a_road : 65.0f);
 
     float road_effect = curg_weight_sus * a_road * LUT[int(phase_sus) & 1023];
 

@@ -210,7 +210,7 @@ $$y_{\text{total}}(t) = y_{\text{ABS}}(t) + y_{\text{Road}}(t) + y_{\text{Slip}}
 Each effect has a different native maximum amplitude, so the firmware uses one normalization factor per effect instead of a single shared headroom multiplier:
 
 $$w_{\text{ABS}} = \frac{1}{120}, \qquad
-w_{\text{Road}} = \frac{1}{70}, \qquad
+w_{\text{Road}} = \frac{1}{65}, \qquad
 w_{\text{Slip}} = \frac{1}{85}$$
 
 The values below are the intended peak DAC-amplitude allocations. The lookup table stores each allocation multiplied by its corresponding normalization factor; for example, an ABS allocation of 85 is stored as $85 \cdot w_{\text{ABS}}$, so the original 120-count ABS waveform contributes at most 85 counts.
@@ -219,7 +219,7 @@ The values below are the intended peak DAC-amplitude allocations. The lookup tab
 | :---: | :--- | ---: | ---: | ---: | ---: |
 | `000` | None | 0 | 0 | 0 | 0 |
 | `001` | ABS only | 120 | 0 | 0 | 120 |
-| `010` | Road only | 0 | 70 | 0 | 70 |
+| `010` | Road only | 0 | 65 | 0 | 70 |
 | `011` | ABS + Road | 85 | 40 | 0 | 125 |
 | `100` | Slip only | 0 | 0 | 85 | 85 |
 | `101` | ABS + Slip | 90 | 0 | 35 | 125 |
