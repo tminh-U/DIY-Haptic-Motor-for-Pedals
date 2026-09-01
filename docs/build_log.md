@@ -1,12 +1,12 @@
 
 # 16/8/2026
 
-![items](Image/1682026-arrived_items.png)
+![items](../Image/1682026-arrived_items.png)
 
 
-**Today arrived items** :
+**Today received items** :
 - ESP32-DEVKIT-V1
-- TPA3116V2 (XH-M542)
+- TPA3116D2 (XH-M542)
 - DC jack (female)
 - Sound exciter extended cable
 - Micro-usb cable
@@ -16,16 +16,16 @@
 
 
 
-![items](Image/1682026-connecting_board.png)
+![items](../Image/1682026-connecting_board.png)
 
 - Connecting ESP32 and the amply through D-point cables
 - Connecting the female DC jack with TPA3116V2
 
 # 18/8/2026
 
-**Today arrived items** :
+**Today received items** :
 - DC 12V - 3A cable
-- 40mm bass transducer
+- 40 mm bass transducer
 - Amplifier case
 - Wire connector
 
@@ -33,7 +33,7 @@
 ## Today works :
 
 ### Connected all of the components.
-![items](Image/1882026-complete_components.jpg)
+![items](../Image/1882026-complete_components.jpg)
 
 
 ### Testing 
@@ -44,10 +44,10 @@
 
 # 21/8/2026
 
-**Today arrived items** : Nothing yet
+**Today received items** : Nothing yet
 ## Today works :
 
-### Complete the firmware for ESP32
+### Completed the ESP32 firmware
 
 ### Testing all effects
 
