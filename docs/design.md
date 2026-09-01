@@ -207,7 +207,7 @@ $$x_{\text{mix}}(t) = g_{\text{ABS}}(t)x_{\text{ABS}}(t) + g_{\text{Road}}(t)x_{
 
 where each $g(t)$ is the corresponding mix-table gain after weight-transition EMA smoothing. The master gain is then applied, and the DAC midpoint is added exactly once to the combined signal:
 
-$$\text{DAC}(t) = \operatorname{clamp}_{[0,255]}\left(128 + 0.80 \cdot x_{\text{mix}}(t)\right)$$
+$$\text{DAC}(t) = \mathrm{clamp}_{[0,255]}\left(128 + 0.80 \cdot x_{\text{mix}}(t)\right)$$
 
 Each effect has a different native maximum amplitude, so the firmware uses one normalization factor per effect instead of a single shared headroom multiplier:
 
