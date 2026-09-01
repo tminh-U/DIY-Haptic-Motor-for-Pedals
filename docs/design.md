@@ -110,23 +110,21 @@ For the road-effect attack, $\alpha = 0.01131$ reaches $\approx 95\%$ convergenc
 - When the remaining EMA difference is very small ($\Delta = |\text{Target}[n] - y[n-1]| < 10^{-4}$), the implementation returns the target value directly. This ends insignificant residual updates and prevents the filter from spending additional interrupt cycles converging on an effectively identical value.
 
 ## Effect calculations
-1. **ABS:** In real life, ABS pulse is caused by the hydraulic modulator releasing and reapplying brake pressure rapidly 10–15 times per second (Bosch Automotive Handbook), so the pulse rate is set to 12 Hz. Because sound exciters have poor low-frequency response at 12 Hz, the firmware pulse-gates a 60 Hz carrier at 12 Hz to preserve the pulse rhythm while producing stronger tactile output. The earlier continuous sine-AM approach is retained below only as design history.
+1. **ABS:** In real life, ABS pulse is caused by the hydraulic modulator releasing and reapplying brake pressure rapidly 10–15 times per second (Bosch Automotive Handbook), so the pulse rate is set to 12 Hz.
 
+**Host-side ABS detection:**
 
-~~$$y_{\text{carrier}}(t) = \sin(2\pi \cdot 60 \cdot t)$$~~
-~~$$y_{\text{mod}}(t) = \sin(2\pi \cdot 12 \cdot t)$$~~
+For Assetto Corsa, the host application does not treat the shared-memory `abs` field as a moment-by-moment activation flag. It derives ABS onset from the Python API's front longitudinal slip ratios; the shared-memory field only confirms availability and optionally supplies a plausible `0.03..0.30` threshold. For Assetto Corsa Competizione, the host uses the native shared-memory `abs` intervention signal directly, so no inferred ABS threshold is required. ACC's later `absInAction` compatibility field is not used because the game does not populate it. For AC, the host-side activation condition is:
 
-~~$$\Rightarrow y(t) = \left( \frac{1 + \sin(2\pi \cdot 12 \cdot t)}{2} \right) \cdot \sin(2\pi \cdot 60 \cdot t)$$~~
+$$\text{absVal} = (\text{brake} > 0.05 \ \land \ \text{speed} > 3\text{ km/h} \ \land \ \text{ABS enabled} \ \land \ \max(|\kappa_{FL}|, |\kappa_{FR}|) \ge \kappa_{ABS})$$
 
-~~$$x_{\text{ABS}}(t) = (120 \cdot \text{brakeVal}) \cdot y(t)$$~~
+Once active, the host keeps `absVal = 1` until the brake/speed/availability gate fails or the maximum front slip falls below $0.70\kappa_{ABS}$. This hysteresis prevents rapid on/off toggling near the threshold.
 
-~~**Note:** `brakeVal` is the normalized brake pedal pressure ($0.0 \le \text{brakeVal} \le 1.0$) from telemetry, and $x_{\text{ABS}}(t)$ is the zero-centered ABS effect sample.~~
+`absVal` is calculated by the host application and transmitted as the first field of the five-field serial packet. The ESP32 firmware does not detect ABS; it only uses this boolean value (`0` or `1`) to disable or enable the ABS waveform.
 
-*(Deprecated - see the 18/8/2026 Update below for the revised approach)*
+**ESP32 waveform generation:**
 
-**[18/8/2026 Update - Square-Wave Pulse Gating]:**
-
-However, physical testing revealed that the continuous sine AM formula produced a soft, mushy vibration due to the mechanical limits of the sound exciter. To achieve crisp and punchy kicks, the continuous modulation was replaced with **square-wave pulse gating (12 Hz, ~60% Duty Cycle)**:
+Because sound exciters have poor low-frequency response at 12 Hz, the firmware pulse-gates a 60 Hz carrier at 12 Hz to preserve the pulse rhythm while producing stronger tactile output. A square-wave gate with an approximately 60% duty cycle produces crisp, distinct kicks:
 
 $$E_{\text{ABS}}(t) = \begin{cases} 
 1 & \text{if } \left(t \bmod \frac{1}{12}\right) \le 3  \cdot \frac{1}{60} \quad (\approx 50\text{ ms ON}) \\
@@ -138,16 +136,6 @@ $$\Rightarrow y_{\text{ABS}}(t) = E_{\text{ABS}}(t) \cdot \sin(2\pi \cdot 60 \cd
 $$x_{\text{ABS}}(t) = (120 \cdot \text{absVal}) \cdot y_{\text{ABS}}(t) \quad (\text{active when } \text{absVal} = 1)$$
 
 This ~60:40 duty cycle (50 ms ON / 33.33 ms OFF) maintains the realistic 12 hydraulic cycles per second of an ABS system while delivering sharp, instantaneous tactile impacts to the pedal.
-
-**[22/8/2026 Update - ABS data]:**
-For Assetto Corsa, the host application does not treat the shared-memory `abs` field as a moment-by-moment activation flag. It derives ABS onset from the Python API's front longitudinal slip ratios; the shared-memory field only confirms availability and optionally supplies a plausible `0.03..0.30` threshold. For Assetto Corsa Competizione, the host uses the native shared-memory `abs` intervention signal directly, so no inferred ABS threshold is required. ACC's later `absInAction` compatibility field is not used because the game does not populate it. For AC, the host-side activation condition is:
-
-$$\text{absVal} = (\text{brake} > 0.05 \ \land \ \text{speed} > 3\text{ km/h} \ \land \ \text{ABS enabled} \ \land \ \max(|\kappa_{FL}|, |\kappa_{FR}|) \ge \kappa_{ABS})$$
-
-Once active, the host keeps `absVal = 1` until the brake/speed/availability gate fails or the maximum front slip falls below $0.70\kappa_{ABS}$. This hysteresis prevents rapid on/off toggling near the threshold.
-
-
-`absVal` is calculated by the host application and transmitted as the first field of the five-field serial packet. The ESP32 firmware does not detect ABS; it only uses this boolean value (`0` or `1`) to disable or enable the ABS waveform.
 
 
 2. **Road Effect:**

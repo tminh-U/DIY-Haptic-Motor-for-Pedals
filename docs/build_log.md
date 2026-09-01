@@ -38,8 +38,23 @@
 
 ### Testing 
 
-- ABS with Amplitude modulation (60Hz - 12Hz) : [Here](https://youtube.com/shorts/pjtzisKoqhs?feature=share)
-- **Comment** : Weak intensity even at max amplitude due to the sound exciter's physical limitations. 
+#### Continuous sine-AM ABS prototype
+
+The first ABS waveform used a 12 Hz sine envelope to modulate a 60 Hz carrier, with brake-pedal pressure controlling the amplitude:
+
+$$y_{\text{carrier}}(t) = \sin(2\pi \cdot 60 \cdot t)$$
+
+$$y_{\text{mod}}(t) = \sin(2\pi \cdot 12 \cdot t)$$
+
+$$y(t) = \left( \frac{1 + \sin(2\pi \cdot 12 \cdot t)}{2} \right) \cdot \sin(2\pi \cdot 60 \cdot t)$$
+
+$$x_{\text{ABS}}(t) = (120 \cdot \text{brakeVal}) \cdot y(t)$$
+
+`brakeVal` is the normalized brake-pedal pressure ($0.0 \le \text{brakeVal} \le 1.0$), and $x_{\text{ABS}}(t)$ is the zero-centered ABS effect sample.
+
+- Test video: [ABS with amplitude modulation (60 Hz carrier / 12 Hz envelope)](https://youtube.com/shorts/pjtzisKoqhs?feature=share)
+- Result: Weak intensity even at maximum amplitude because of the sound exciter's physical limitations.
+- Decision: Replace the continuous sine envelope with 12 Hz square-wave pulse gating to produce sharper pedal kicks. The current implementation is documented in [Design rationale and control logic](design.md#effect-calculations).
 
 
 # 21/8/2026
@@ -55,6 +70,17 @@
 - Demo video (slip effect) : [Here](https://youtube.com/shorts/F_2Ib3Tkiu4?feature=share)
 - Demo video (road effect) : [Here](https://youtube.com/shorts/F_2Ib3Tkiu4?feature=share)
 
+
+# 22/8/2026
+
+**Today received items** : Nothing yet
+## Today works :
+
+### Refined ABS telemetry handling
+
+- Assetto Corsa: Derive ABS activation from the Python API's front longitudinal slip ratios. Use the shared-memory `abs` field only as an availability hint and, when plausible, as the slip threshold.
+- Assetto Corsa Competizione: Use the native shared-memory `abs` intervention signal directly; do not use the unpopulated `absInAction` compatibility field.
+- Normalize both paths to the same boolean `absVal` field before serial transmission to the ESP32.
 
 
 
