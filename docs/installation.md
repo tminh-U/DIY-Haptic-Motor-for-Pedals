@@ -5,15 +5,22 @@
 
 See [Hardware guide](hardware.md).
 
+# 2. Install the app
+
+- Get `HapticBrakeControl_Setup.exe` from [Github Releases](https://github.com/tminh-U/DIY-Haptic-Motor-for-Pedals/releases).
+- Install the app
+
 ## 2. Flash the ESP32 firmware
 
-- Get `haptic_firmware.ino` from [Github Releases](https://github.com/tminh-U/DIY-Haptic-Motor-for-Pedals/releases).
-- Open with Arduino IDE.
-- Select **ESP32 Dev Module** and the ESP32's COM port.
-- Click **Verify**, then **Upload**.
+- Open `Haptic Brake Control`.
+- Connect the ESP32 to the computer through USB.
+- Open `Firmware` tab.
+- Select `Manual flash`.
+- Select ESP32 COM port and 
+
 
 ## 3. Install the communicate application
-- Get `get_telemetry.exe` from [Github Releases](https://github.com/tminh-U/DIY-Haptic-Motor-for-Pedals/releases).
+- Open `Haptic Brake Control`.
 - The host application automatically detects whether Assetto Corsa or Assetto Corsa Competizione is running, so no manual game selection is required.
 
 ## 4. Configure the game
@@ -36,8 +43,5 @@ For **Assetto Corsa Competizione**, no Python app or UDP configuration is requir
 
 | Status | Expected value |
 |---|---|
-| ESP32 | `[AUTO CONNECTED] COMx` |
-| AC | `AC Python API: [RECEIVING]` |
-| ACC | `ACC Shared Memory: [RECEIVING]` |
 | ESP32 LED | LED ON while valid packets are received |
 
