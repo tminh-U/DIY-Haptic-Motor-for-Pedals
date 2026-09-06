@@ -94,14 +94,14 @@ and silences the exciter.
 Invalid packets and `ID?` requests do not refresh the ESP32 watchdog.
 
 
-### Automatic ESP32 discovery
+### Automatic ESP32 discovery and updater
 
 The ESP32 has a stable eFuse MAC identifier. On every connection attempt, the PC app opens each available COM port with DTR/RTS disabled, sends the following request, and keeps only the port that returns the expected protocol prefix:
 
 ```text
 PC   -> ID?\n
-ESP32 -> HAPTIC_PEDAL,1,<12-digit-eFuse-MAC>\n
+ESP32 -> HAPTIC_PEDAL,1,<12-digit-eFuse-MAC>,<firmware-version>\n
 ```
-For example, `HAPTIC_PEDAL,1,00C4D2BD2A58` is a valid wire response. This means COM port numbering may change after reconnecting USB without requiring the user to select a port manually.
+For example, `HAPTIC_PEDAL,1,00C4D2BD2A58, 1.01` is a valid wire response. This means COM port numbering may change after reconnecting USB without requiring the user to select a port manually. Also, this ID also allows the app to identify the firmware version currently installed on the board and determine whether an update is available.
 
 

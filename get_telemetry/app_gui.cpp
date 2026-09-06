@@ -1,11 +1,15 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <windowsx.h>
+#include <dbt.h>
 #include <tlhelp32.h>
 #include <commctrl.h>
 #include <uxtheme.h>
 #include <dwmapi.h>
 #include <timeapi.h>
+#include <shellapi.h>
+#include <shlobj.h>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -18,19 +22,27 @@
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
+#include <string_view>
 #include "structed_file_AC.h"
 #include "structed_file_ACC.h"
+#include "settings_service.h"
+#include "firmware_service.h"
+#include "modern_ui.h"
 
+#ifdef _MSC_VER
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winhttp.lib")
+#endif
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
-//Compile arg : g++ -std=c++17 -O2 app_gui.cpp -o get_telemetry.exe -mwindows -static -static-libgcc -static-libstdc++ -lcomctl32 -luxtheme -ldwmapi -lgdi32 -lwinmm -s
+// Build with: powershell -ExecutionPolicy Bypass -File build.ps1
 
 
 
@@ -48,6 +60,10 @@ const auto SERIAL_DURATION = chrono::microseconds(1000000 / SERIAL_HZ);
 const char* PYTHON_SHARED_MEMORY_NAME = "haptic_telemetry_v1";
 const float DEFAULT_ABS_SLIP_RATIO = 0.10f;
 const float DEFAULT_SUSPENSION_MAX_TRAVEL = 0.10f;
+atomic<float> g_masterGain{0.78f};
+atomic<float> g_absGain{1.0f};
+atomic<float> g_roadGain{0.68f};
+atomic<float> g_slipGain{0.82f};
 
 enum class GameKind : int {
     None = 0,
@@ -83,13 +99,16 @@ GameKind detectRunningGame() {
 
 atomic<HANDLE> hSerial{INVALID_HANDLE_VALUE};
 atomic<bool> g_pauseSerialWrites{false};
+atomic<bool> g_connectionStopRequested{false};
+atomic<ULONGLONG> g_lastDeviceHeartbeat{0};
+mutex g_serialWriteMutex;
 const char* HAPTIC_HANDSHAKE_REQUEST = "ID?\n";
 const char* HAPTIC_HANDSHAKE_PREFIX = "HAPTIC_PEDAL,1,";
 
 vector<string> getAvailableCOMPorts();
 
 bool configureSerial(HANDLE serial) {
-    DCB dcbSerialParams = { 0 };
+    DCB dcbSerialParams = {};
     dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
     if (!GetCommState(serial, &dcbSerialParams)) {
         return false;
@@ -104,7 +123,7 @@ bool configureSerial(HANDLE serial) {
         return false;
     }
 
-    COMMTIMEOUTS timeouts = { 0 };
+    COMMTIMEOUTS timeouts = {};
     timeouts.ReadIntervalTimeout = 10;
     timeouts.ReadTotalTimeoutConstant = 50;
     timeouts.ReadTotalTimeoutMultiplier = 0;
@@ -163,13 +182,23 @@ bool tryOpenHapticPort(const string& portName, HANDLE& outSerial, char* deviceId
 
     // Some USB-UART bridges can still reset the ESP32 while the port opens.
     // Wait for its Core 0 UART task before asking for the identity.
-    Sleep(1800);
+    for (int waitStep = 0; waitStep < 18; ++waitStep) {
+        if (g_connectionStopRequested.load(memory_order_acquire)) {
+            CloseHandle(serial);
+            return false;
+        }
+        Sleep(100);
+    }
     if (!PurgeComm(serial, PURGE_RXCLEAR | PURGE_TXCLEAR)) {
         CloseHandle(serial);
         return false;
     }
 
     if (!readHapticIdentity(serial, deviceId, deviceIdSize)) {
+        CloseHandle(serial);
+        return false;
+    }
+    if (g_connectionStopRequested.load(memory_order_acquire)) {
         CloseHandle(serial);
         return false;
     }
@@ -185,6 +214,7 @@ bool initSerialAuto(char* portName, size_t portNameSize, char* deviceId, size_t 
 
         strncpy_s(portName, portNameSize, candidate.c_str(), _TRUNCATE);
         strncpy_s(deviceId, deviceIdSize, foundDeviceId, _TRUNCATE);
+        g_lastDeviceHeartbeat.store(GetTickCount64(), memory_order_release);
         hSerial.store(serial, memory_order_release);
         return true;
     }
@@ -280,12 +310,22 @@ bool initPythonTelemetry() {
 
 void sendDataToESP32(float absVal, float slipRatioL, float slipRatioR, float roadL, float roadR) {
     if (g_pauseSerialWrites.load(memory_order_acquire)) return;
+    const float master = g_masterGain.load(memory_order_relaxed);
+    absVal *= master * g_absGain.load(memory_order_relaxed);
+    slipRatioL *= master * g_slipGain.load(memory_order_relaxed);
+    slipRatioR *= master * g_slipGain.load(memory_order_relaxed);
+    roadL *= master * g_roadGain.load(memory_order_relaxed);
+    roadR *= master * g_roadGain.load(memory_order_relaxed);
+    char buffer[64];
+    int len = sprintf_s(buffer, "%.4f,%.4f,%.4f,%.4f,%.4f\n", absVal, slipRatioL, slipRatioR, roadL, roadR);
+    lock_guard<mutex> writeLock(g_serialWriteMutex);
     HANDLE serial = hSerial.load(memory_order_acquire);
     if (serial == INVALID_HANDLE_VALUE) return;
-    char buffer[64];
-    int len = sprintf_s(buffer, "%.2f,%.4f,%.4f,%.4f,%.4f\n", absVal, slipRatioL, slipRatioR, roadL, roadR);
-    DWORD bytesWritten;
-    WriteFile(serial, buffer, len, &bytesWritten, NULL);
+    DWORD bytesWritten = 0;
+    if (!WriteFile(serial, buffer, len, &bytesWritten, NULL)
+        || bytesWritten != static_cast<DWORD>(len)) {
+        g_connectionStopRequested.store(true, memory_order_release);
+    }
 }
 
 float suspensionMaxTravel(GameKind game, int wheelIndex) {
@@ -441,41 +481,107 @@ bool readAccTelemetry(NormalizedTelemetry& out) {
 // 2. THREADING & GUI CONTROLLER
 // ==============================================================================
 
-// Control IDs
 #define IDC_COMBO_PORTS     1001
-#define IDC_BTN_REFRESH     1002
-#define IDC_BTN_CONNECT     1003
-#define IDC_LBL_SERIAL_STAT 1004
-#define IDC_LBL_GAME_STAT   1005
-#define IDC_PRG_BRAKE       1006
-#define IDC_LBL_BRAKE_VAL   1007
-#define IDC_LBL_ABS_STAT    1008
-#define IDC_PRG_SLIP_L      1009
-#define IDC_PRG_SLIP_R      1010
-#define IDC_LBL_SLIP_VAL    1011
-#define IDC_LBL_SUS_VAL     1012
-#define IDC_LBL_FPS         1013
-#define IDC_LBL_PANIC_STAT  1014
 
 HINSTANCE hInst;
 HWND hWndMain;
-HWND hComboPorts, hBtnRefresh, hBtnConnect;
-HWND hLblSerialStat, hLblGameStat, hLblFPS;
-HWND hPrgBrake, hLblBrakeVal, hLblAbsStat;
-HWND hPrgSlipL, hPrgSlipR, hLblSlipVal, hLblSusVal;
-HWND hLblRawBrake, hLblRawSlipL, hLblRawSlipR, hLblRawSusL, hLblRawSusR, hLblRawAbs;
-HWND hLblPanicStat;
+HWND hComboPorts;
+bool g_manualFlashPortSelected = false;
+HFONT hFontRegular, hFontBold;
+HFONT hFontSmall, hFontPageTitle, hFontHero, hFontValue;
+HICON g_appIcon = nullptr;
+bool g_appIconOwned = false;
+HANDLE g_singleInstanceMutex = nullptr;
+vector<wstring> g_privateUiFontPaths;
+bool g_googleSansFlexLoaded = false;
 
-HBRUSH hBrushBg;
-HBRUSH hBrushCard;
-HBRUSH hBrushBtnDark;
-HBRUSH hBrushActiveAbs;
-HBRUSH hBrushInactiveAbs;
-HBRUSH hBrushPanicBg;
-HFONT hFontRegular, hFontBold, hFontTitle, hFontStatus;
+const wchar_t* regularUiFontFamily() {
+    return g_googleSansFlexLoaded ? L"Google Sans Flex 18pt" : L"Segoe UI";
+}
+
+const wchar_t* mediumUiFontFamily() {
+    return g_googleSansFlexLoaded ? L"Google Sans Flex 18pt Medium" : L"Segoe UI";
+}
+
+void loadPrivateUiFonts() {
+    const wstring fontDirectory = firmwareServiceAppDirectory() + L"\\fonts\\";
+    const wchar_t* fontFiles[] = {
+        L"GoogleSansFlex-Regular.ttf",
+        L"GoogleSansFlex-Medium.ttf"
+    };
+
+    for (const wchar_t* fontFile : fontFiles) {
+        const wstring fontPath = fontDirectory + fontFile;
+        if (AddFontResourceExW(fontPath.c_str(), FR_PRIVATE, nullptr) > 0) {
+            g_privateUiFontPaths.push_back(fontPath);
+        }
+    }
+    g_googleSansFlexLoaded = g_privateUiFontPaths.size() == 2;
+}
+
+void unloadPrivateUiFonts() {
+    for (const wstring& fontPath : g_privateUiFontPaths) {
+        RemoveFontResourceExW(fontPath.c_str(), FR_PRIVATE, nullptr);
+    }
+    g_privateUiFontPaths.clear();
+    g_googleSansFlexLoaded = false;
+}
+
+bool privateUiFontSmokeTest() {
+    loadPrivateUiFonts();
+    if (!g_googleSansFlexLoaded) return false;
+
+    HDC dc = CreateCompatibleDC(nullptr);
+    HFONT font = CreateFontW(-21, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, regularUiFontFamily());
+    wchar_t selectedFace[LF_FACESIZE] = {};
+    HGDIOBJ previousFont = dc && font ? SelectObject(dc, font) : nullptr;
+    const bool selected = dc && font
+        && GetTextFaceW(dc, LF_FACESIZE, selectedFace) > 0
+        && wcscmp(selectedFace, L"Google Sans Flex 18pt") == 0;
+    if (previousFont) SelectObject(dc, previousFont);
+    if (font) DeleteObject(font);
+    if (dc) DeleteDC(dc);
+    unloadPrivateUiFonts();
+    return selected;
+}
+
+AppSettings g_settings;
+int g_activePage = 0;
+int g_dragSlider = -1;
+std::wstring g_latestFirmware = L"Not checked";
+std::wstring g_firmwareStatus = L"Ready";
+std::string g_latestFirmwareUrl;
+std::string g_latestFirmwareSketchUrl;
+DWORD g_latestFirmwareOffset = 0;
+bool g_latestSupportsBlankBoard = false;
+mutex g_firmwareMutex;
+atomic<bool> g_updateChecking{false};
+atomic<bool> g_flashing{false};
+atomic<int> g_firmwareStage{0};
+atomic<int> g_downloadProgress{0};
+atomic<bool> g_appClosing{false};
+atomic<bool> g_powerSuspended{false};
+atomic<ULONGLONG> g_reconnectNotBefore{0};
+thread g_updateThread;
+thread g_flashThread;
+std::wstring g_pendingFirmwarePath;
+std::wstring g_pendingFirmwarePort;
+bool g_pendingFirmwareIsTemporary = false;
+bool g_pendingFirmwareUsesArduinoCli = false;
+DWORD g_pendingFirmwareOffset = 0;
+NOTIFYICONDATAW g_trayIcon = {};
+bool g_trayIconVisible = false;
+const UINT WM_TRAYICON = WM_APP + 20;
+constexpr int UI_DESIGN_WIDTH = 720;
+constexpr int UI_DESIGN_HEIGHT = 900;
+constexpr int UI_LOGICAL_WIDTH = 480;
+constexpr int UI_LOGICAL_HEIGHT = 600;
 
 atomic<bool> isRunning(false);
 atomic<bool> isConnected(false);
+atomic<int> g_detectedGameForUi{0};
 thread workerThread;
 thread serialMonitorThread;
 
@@ -531,6 +637,18 @@ SerialTelemetryFrame latestSerialFrame() {
     return g_serialFrame;
 }
 
+void signalSerialDisconnect(int status = 2) {
+    g_connectionStopRequested.store(true, memory_order_release);
+    isConnected.store(false, memory_order_release);
+    isRunning.store(false, memory_order_release);
+    g_serialStatus.store(status, memory_order_release);
+    g_reconnectNotBefore.store(GetTickCount64() + 500, memory_order_release);
+}
+
+bool deviceHeartbeatExpired(ULONGLONG now, ULONGLONG lastHeartbeat) {
+    return lastHeartbeat != 0 && now - lastHeartbeat > 5000;
+}
+
 void serialSenderWorker() {
     auto nextSend = chrono::steady_clock::now();
     while (isRunning) {
@@ -538,6 +656,10 @@ void serialSenderWorker() {
         SerialTelemetryFrame frame = latestSerialFrame();
         sendDataToESP32(frame.absVal, frame.slipRatioL, frame.slipRatioR,
                         frame.roadL, frame.roadR);
+        if (g_connectionStopRequested.load(memory_order_acquire)) {
+            signalSerialDisconnect();
+            break;
+        }
 
         auto now = chrono::steady_clock::now();
         if (nextSend < now - SERIAL_DURATION) nextSend = now;
@@ -546,8 +668,6 @@ void serialSenderWorker() {
 
     sendDataToESP32(0, 0, 0, 0, 0);
 }
-
-int g_prevSerialStatus = -1; // Track previous status to avoid redundant GUI updates
 
 // Enumerate available COM ports from Windows Registry
 vector<string> getAvailableCOMPorts() {
@@ -582,24 +702,26 @@ vector<string> getAvailableCOMPorts() {
     return portList;
 }
 
-void refreshPortList() {
-    SendMessage(hComboPorts, CB_RESETCONTENT, 0, 0);
-    auto ports = getAvailableCOMPorts();
-    for (const auto& p : ports) {
-        SendMessageA(hComboPorts, CB_ADDSTRING, 0, (LPARAM)p.c_str());
-    }
-    if (!ports.empty()) {
-        SendMessage(hComboPorts, CB_SETCURSEL, 0, 0);
-    }
+// Serial Monitor Thread: reads lines from ESP32 and detects fatal panics
+bool writeHeartbeat(HANDLE expectedSerial) {
+    lock_guard<mutex> writeLock(g_serialWriteMutex);
+    HANDLE serial = hSerial.load(memory_order_acquire);
+    if (serial == INVALID_HANDLE_VALUE || serial != expectedSerial) return false;
+    DWORD bytesWritten = 0;
+    const DWORD requestLength = static_cast<DWORD>(strlen(HAPTIC_HANDSHAKE_REQUEST));
+    return WriteFile(serial, HAPTIC_HANDSHAKE_REQUEST, requestLength,
+                     &bytesWritten, nullptr)
+        && bytesWritten == requestLength;
 }
 
-// Serial Monitor Thread: reads lines from ESP32 and detects fatal panics
 void serialMonitorWorker() {
     char readBuf[512];
     char lineBuf[512];
     int linePos = 0;
     bool isCapturing = false;
     int captureLines = 0;
+    HANDLE monitoredSerial = INVALID_HANDLE_VALUE;
+    ULONGLONG lastHeartbeatSent = 0;
 
     while (isRunning) {
         HANDLE serial = hSerial.load(memory_order_acquire);
@@ -608,13 +730,45 @@ void serialMonitorWorker() {
             continue;
         }
 
+        const ULONGLONG now = GetTickCount64();
+        if (serial != monitoredSerial) {
+            monitoredSerial = serial;
+            lastHeartbeatSent = now;
+            g_lastDeviceHeartbeat.store(now, memory_order_release);
+        } else if (now - lastHeartbeatSent >= 2000) {
+            if (!writeHeartbeat(serial)) {
+                signalSerialDisconnect();
+                break;
+            }
+            lastHeartbeatSent = now;
+        }
+
         DWORD bytesRead = 0;
-        if (ReadFile(serial, readBuf, sizeof(readBuf) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        const BOOL readSucceeded = ReadFile(
+            serial, readBuf, sizeof(readBuf) - 1, &bytesRead, NULL);
+        if (!readSucceeded) {
+            signalSerialDisconnect();
+            break;
+        }
+        if (bytesRead > 0) {
             for (DWORD i = 0; i < bytesRead; i++) {
                 char c = readBuf[i];
                 if (c == '\n' || c == '\r') {
                     if (linePos > 0) {
                         lineBuf[linePos] = '\0';
+                        if (strncmp(lineBuf, HAPTIC_HANDSHAKE_PREFIX,
+                                    strlen(HAPTIC_HANDSHAKE_PREFIX)) == 0) {
+                            const char* identity = lineBuf + strlen(HAPTIC_HANDSHAKE_PREFIX);
+                            if (g_hapticDeviceId[0] != '\0'
+                                && strcmp(identity, g_hapticDeviceId) != 0) {
+                                signalSerialDisconnect();
+                                linePos = 0;
+                                break;
+                            }
+                            g_lastDeviceHeartbeat.store(GetTickCount64(), memory_order_release);
+                            linePos = 0;
+                            continue;
+                        }
                         // Check for ESP32 fatal panic keywords
                         if (!isCapturing) {
                             if (strstr(lineBuf, "Guru Meditation") || strstr(lineBuf, "panic") ||
@@ -625,6 +779,7 @@ void serialMonitorWorker() {
                                 g_panicMessage[sizeof(g_panicMessage) - 1] = '\0';
                                 g_pauseSerialWrites.store(true, memory_order_release);
                                 g_esp32Panicked = true;
+                                signalSerialDisconnect(5);
                                 isCapturing = true;
                                 captureLines = 0;
                             }
@@ -645,6 +800,13 @@ void serialMonitorWorker() {
         } else {
             // No data available, small sleep to avoid busy-wait
             this_thread::sleep_for(chrono::milliseconds(10));
+        }
+
+
+        if (deviceHeartbeatExpired(
+                GetTickCount64(), g_lastDeviceHeartbeat.load(memory_order_acquire))) {
+            signalSerialDisconnect();
+            break;
         }
     }
 }
@@ -668,7 +830,12 @@ void telemetryWorker() {
     if (!initSerialAuto(g_serialPortName, sizeof(g_serialPortName), g_hapticDeviceId, sizeof(g_hapticDeviceId))) {
         isConnected = false;
         isRunning = false;
-        g_serialStatus = 4;
+        g_serialStatus = g_connectionStopRequested.load(memory_order_acquire) ? 3 : 4;
+        return;
+    }
+
+    if (g_connectionStopRequested.load(memory_order_acquire) || !isRunning.load()) {
+        isConnected = false;
         return;
     }
 
@@ -865,442 +1032,956 @@ void telemetryWorker() {
     g_live.gameKind = 0;
     g_live.acState = 0;
     g_live.fps = 0;
-    g_serialStatus = 3;
+    if (g_serialStatus.load() == 1) g_serialStatus = 3;
+}
+
+std::wstring utf8ToWide(const std::string& value) {
+    if (value.empty()) return {};
+    int count = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
+    if (count <= 1) return {};
+    std::wstring result(static_cast<size_t>(count), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, result.data(), count);
+    result.pop_back();
+    return result;
+}
+
+std::wstring deviceIdentity() {
+    std::string raw(g_hapticDeviceId);
+    const size_t comma = raw.find(',');
+    if (comma != std::string::npos) raw.resize(comma);
+    return utf8ToWide(raw);
+}
+
+std::wstring installedFirmwareVersion() {
+    std::string raw(g_hapticDeviceId);
+    const size_t comma = raw.find(',');
+    if (comma == std::string::npos || comma + 1 >= raw.size()) return L"Unknown";
+    return utf8ToWide(raw.substr(comma + 1));
+}
+
+void applyEffectSettings() {
+    g_masterGain = g_settings.masterVolume / 100.0f;
+    g_absGain = g_settings.absPulse / 100.0f;
+    g_roadGain = g_settings.roadTexture / 100.0f;
+    g_slipGain = g_settings.tireSlip / 100.0f;
+}
+
+void persistSettings() {
+    applyEffectSettings();
+    saveAppSettings(g_settings);
+}
+
+void refreshPortList() {
+    if (!hComboPorts) return;
+    char selected[32] = {};
+    GetWindowTextA(hComboPorts, selected, sizeof(selected));
+    SendMessage(hComboPorts, CB_RESETCONTENT, 0, 0);
+    const auto ports = getAvailableCOMPorts();
+    int selectedIndex = -1;
+    for (size_t index = 0; index < ports.size(); ++index) {
+        SendMessageA(hComboPorts, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(ports[index].c_str()));
+        if (_stricmp(selected, ports[index].c_str()) == 0) selectedIndex = static_cast<int>(index);
+    }
+    if (g_manualFlashPortSelected && selectedIndex >= 0) {
+        SendMessage(hComboPorts, CB_SETCURSEL, selectedIndex, 0);
+    } else {
+        SendMessage(hComboPorts, CB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+        g_manualFlashPortSelected = false;
+    }
+}
+
+void updateFirmwareControls() {
+    if (!hComboPorts) return;
+    if (g_activePage == 2) refreshPortList();
+}
+
+void startConnection() {
+    if (g_flashing.load() || isRunning.load() || g_appClosing.load()
+        || g_powerSuspended.load()) return;
+    if (workerThread.joinable()) workerThread.join();
+    if (serialMonitorThread.joinable()) serialMonitorThread.join();
+    closeSerial();
+    g_serialPortName[0] = '\0';
+    g_hapticDeviceId[0] = '\0';
+    g_serialStatus = 0;
+    g_esp32Panicked = false;
+    g_panicMsgBoxShown = false;
+    g_pauseSerialWrites = false;
+    g_connectionStopRequested = false;
+    g_lastDeviceHeartbeat = 0;
+    {
+        lock_guard<mutex> lock(g_panicMutex);
+        g_panicMessage[0] = '\0';
+    }
+    isRunning = true;
+    workerThread = thread(telemetryWorker);
+    serialMonitorThread = thread(serialMonitorWorker);
+}
+
+void stopConnection() {
+    g_connectionStopRequested = true;
+    isRunning = false;
+    if (workerThread.joinable()) workerThread.join();
+    if (serialMonitorThread.joinable()) serialMonitorThread.join();
+    closeSerial();
+    isConnected = false;
+}
+
+HICON createWaveLogoIcon() {
+    constexpr int iconSize = 64;
+    BITMAPV5HEADER bitmapInfo = {};
+    bitmapInfo.bV5Size = sizeof(bitmapInfo);
+    bitmapInfo.bV5Width = iconSize;
+    bitmapInfo.bV5Height = -iconSize;
+    bitmapInfo.bV5Planes = 1;
+    bitmapInfo.bV5BitCount = 32;
+    bitmapInfo.bV5Compression = BI_RGB;
+
+    void* pixels = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP color = CreateDIBSection(screen, reinterpret_cast<BITMAPINFO*>(&bitmapInfo),
+        DIB_RGB_COLORS, &pixels, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (!color || !pixels) {
+        if (color) DeleteObject(color);
+        return nullptr;
+    }
+
+    HDC iconDc = CreateCompatibleDC(nullptr);
+    HGDIOBJ oldBitmap = SelectObject(iconDc, color);
+    RECT area = {0, 0, iconSize, iconSize};
+    HBRUSH background = CreateSolidBrush(RGB(8, 25, 38));
+    FillRect(iconDc, &area, background);
+    DeleteObject(background);
+
+    const int heights[] = {12, 34, 50, 27, 14};
+    HPEN wave = CreatePen(PS_SOLID, 5, RGB(24, 190, 246));
+    HGDIOBJ oldPen = SelectObject(iconDc, wave);
+    SetBkMode(iconDc, TRANSPARENT);
+    for (int index = 0; index < 5; ++index) {
+        const int x = 12 + index * 10;
+        MoveToEx(iconDc, x, 32 - heights[index] / 2, nullptr);
+        LineTo(iconDc, x, 32 + heights[index] / 2);
+    }
+    SelectObject(iconDc, oldPen);
+    DeleteObject(wave);
+    SelectObject(iconDc, oldBitmap);
+    DeleteDC(iconDc);
+
+    BYTE maskBits[(iconSize * iconSize) / 8] = {0};
+    HBITMAP mask = CreateBitmap(iconSize, iconSize, 1, 1, maskBits);
+    ICONINFO info = {};
+    info.fIcon = TRUE;
+    info.hbmColor = color;
+    info.hbmMask = mask;
+    HICON result = CreateIconIndirect(&info);
+    DeleteObject(color);
+    DeleteObject(mask);
+    return result;
+}
+
+void addTrayIcon(HWND window) {
+    if (g_trayIconVisible) return;
+    g_trayIcon = {};
+    g_trayIcon.cbSize = sizeof(g_trayIcon);
+    g_trayIcon.hWnd = window;
+    g_trayIcon.uID = 1;
+    g_trayIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_trayIcon.uCallbackMessage = WM_TRAYICON;
+    g_trayIcon.hIcon = g_appIcon ? g_appIcon : LoadIcon(nullptr, IDI_APPLICATION);
+    wcscpy_s(g_trayIcon.szTip, L"Haptic Brake Control");
+    g_trayIconVisible = Shell_NotifyIconW(NIM_ADD, &g_trayIcon) != FALSE;
+}
+
+void removeTrayIcon() {
+    if (!g_trayIconVisible) return;
+    Shell_NotifyIconW(NIM_DELETE, &g_trayIcon);
+    g_trayIconVisible = false;
+}
+
+modern_ui::DrawModel currentDrawModel() {
+    modern_ui::DrawModel model;
+    model.page = g_activePage;
+    model.settings = g_settings;
+    model.connected = isConnected.load();
+    model.panicked = g_esp32Panicked.load();
+    model.checkingUpdate = g_updateChecking.load();
+    model.flashing = g_flashing.load();
+    const int detectedGame = g_detectedGameForUi.load();
+    const int telemetryGame = g_live.gameKind.load();
+    const int telemetryState = g_live.acState.load();
+    model.gameDetected = detectedGame != static_cast<int>(GameKind::None);
+    model.telemetryActive = model.gameDetected && model.connected
+        && telemetryGame == detectedGame && telemetryState == 2;
+    if (detectedGame == static_cast<int>(GameKind::AC)) {
+        model.gameName = L"Assetto Corsa";
+    } else if (detectedGame == static_cast<int>(GameKind::ACC)) {
+        model.gameName = L"Assetto Corsa Competizione";
+    }
+    if (model.telemetryActive) {
+        model.gameStatus = L"Telemetry active";
+    } else if (model.gameDetected && !model.connected) {
+        model.gameStatus = L"Controller not connected";
+    } else if (model.gameDetected) {
+        model.gameStatus = L"Waiting for telemetry";
+    }
+    model.firmwareStage = g_firmwareStage.load();
+    model.downloadProgress = g_downloadProgress.load();
+    const int portCount = hComboPorts
+        ? static_cast<int>(SendMessage(hComboPorts, CB_GETCOUNT, 0, 0)) : 0;
+    model.portSelected = g_manualFlashPortSelected && hComboPorts
+        && SendMessage(hComboPorts, CB_GETCURSEL, 0, 0) != CB_ERR;
+    if (model.portSelected) {
+        wchar_t port[32] = {};
+        GetWindowTextW(hComboPorts, port, 32);
+        model.selectedPort = port;
+    } else if (portCount > 0) {
+        model.selectedPort = L"Select a COM port";
+    }
+    model.deviceId = deviceIdentity();
+    model.currentFirmware = model.connected ? installedFirmwareVersion() : L"Not detected";
+    {
+        lock_guard<mutex> lock(g_firmwareMutex);
+        model.latestFirmware = g_latestFirmware;
+        model.firmwareStatus = g_firmwareStatus;
+        model.binaryAvailable = !g_latestFirmwareUrl.empty()
+            || !g_latestFirmwareSketchUrl.empty();
+        model.manualBinaryAvailable = (!g_latestFirmwareUrl.empty()
+            && g_latestSupportsBlankBoard) || !g_latestFirmwareSketchUrl.empty();
+    }
+    return model;
+}
+
+void beginUpdateCheck(HWND window) {
+    if (g_updateChecking.exchange(true)) return;
+    if (g_updateThread.joinable()) g_updateThread.join();
+    {
+        lock_guard<mutex> lock(g_firmwareMutex);
+        g_firmwareStatus = L"Contacting GitHub Releases...";
+    }
+    InvalidateRect(window, nullptr, FALSE);
+    g_updateThread = thread([window] {
+        FirmwareRelease release = fetchLatestFirmwareRelease();
+        {
+            lock_guard<mutex> lock(g_firmwareMutex);
+            if (release.ok) {
+                g_latestFirmware = utf8ToWide(release.version);
+                g_latestFirmwareUrl = release.binaryUrl;
+                g_latestFirmwareSketchUrl = release.sketchUrl;
+                g_latestFirmwareOffset = release.flashOffset;
+                g_latestSupportsBlankBoard = release.supportsBlankBoard;
+                std::wstring installed = installedFirmwareVersion();
+                if (release.binaryUrl.empty() && release.sketchUrl.empty()) {
+                    g_firmwareStatus = L"Latest release has no .bin or .ino firmware asset.";
+                } else if (release.binaryUrl.empty()) {
+                    g_firmwareStatus = L"Arduino source found; Arduino CLI will compile it before flashing.";
+                } else if (!release.supportsBlankBoard) {
+                    g_firmwareStatus = L"Update image found; blank-board flashing needs a merged .bin asset.";
+                } else {
+                    g_firmwareStatus = installed == L"Unknown" || installed == L"Not detected"
+                        ? L"Latest firmware is ready to download and flash."
+                        : (installed == g_latestFirmware ? L"Your device is up to date."
+                                                         : L"A firmware update is available.");
+                }
+            } else {
+                g_latestFirmware = L"Unavailable";
+                g_firmwareStatus = L"Update check failed: " + utf8ToWide(release.error);
+            }
+        }
+        g_updateChecking = false;
+        if (!g_appClosing.load()) PostMessage(window, WM_APP + 21, 0, 0);
+    });
+}
+
+void showPortSelector(HWND window) {
+    if (g_flashing.load()) return;
+    refreshPortList();
+    const int count = static_cast<int>(SendMessage(hComboPorts, CB_GETCOUNT, 0, 0));
+    HMENU menu = CreatePopupMenu();
+    if (count <= 0) {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"No COM ports found");
+    } else {
+        for (int index = 0; index < count; ++index) {
+            wchar_t port[32] = {};
+            SendMessageW(hComboPorts, CB_GETLBTEXT, index, reinterpret_cast<LPARAM>(port));
+            AppendMenuW(menu, MF_STRING, 9100 + index, port);
+        }
+    }
+    RECT client = {};
+    GetClientRect(window, &client);
+    POINT position{
+        MulDiv(55, client.right, UI_DESIGN_WIDTH),
+        MulDiv(637, client.bottom, UI_DESIGN_HEIGHT)
+    };
+    ClientToScreen(window, &position);
+    SetForegroundWindow(window);
+    TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+                   position.x, position.y, 0, window, nullptr);
+    DestroyMenu(menu);
+}
+
+void launchEsptoolFlash(HWND window, const std::wstring& selectedPort,
+                        const std::wstring& selectedFile, DWORD flashOffset,
+                        bool deleteAfterFlash) {
+    stopConnection();
+    g_firmwareStage = 2;
+    updateFirmwareControls();
+    if (g_flashThread.joinable()) g_flashThread.join();
+    {
+        lock_guard<mutex> lock(g_firmwareMutex);
+        g_firmwareStatus = L"Flashing firmware on " + selectedPort + L"...";
+    }
+    g_flashThread = thread([
+        window, selectedPort, selectedFile, flashOffset, deleteAfterFlash] {
+        DWORD exitCode = 0;
+        std::string error;
+        bool success = flashFirmwareWithEsptool(
+            selectedPort, selectedFile, flashOffset, exitCode, error);
+        if (deleteAfterFlash) DeleteFileW(selectedFile.c_str());
+        {
+            lock_guard<mutex> lock(g_firmwareMutex);
+            g_firmwareStatus = success ? L"Firmware flash completed. Reconnecting..."
+                                       : L"Firmware flash failed: " + utf8ToWide(error);
+        }
+        g_firmwareStage = 0;
+        g_flashing = false;
+        if (!g_appClosing.load()) PostMessage(window, WM_APP + 22, 1, success ? 1 : 0);
+    });
+}
+
+void launchArduinoCliFlash(HWND window, const std::wstring& selectedPort,
+                           const std::wstring& sketchPath,
+                           bool deleteAfterFlash) {
+    stopConnection();
+    g_firmwareStage = 3;
+    updateFirmwareControls();
+    if (g_flashThread.joinable()) g_flashThread.join();
+    {
+        lock_guard<mutex> lock(g_firmwareMutex);
+        g_firmwareStatus = L"Checking Arduino CLI and the ESP32 board package...";
+    }
+    g_flashThread = thread([window, selectedPort, sketchPath, deleteAfterFlash] {
+        DWORD exitCode = 0;
+        std::string error;
+        const std::wstring cli = findArduinoCli();
+        bool success = !cli.empty();
+        if (!success) {
+            error = "Arduino CLI was not found. Install it or put arduino-cli.exe next to the app.";
+        } else {
+            success = ensureEsp32ArduinoCore(cli, error);
+        }
+        if (success) {
+            g_firmwareStage = 4;
+            {
+                lock_guard<mutex> lock(g_firmwareMutex);
+                g_firmwareStatus = L"Compiling the .ino and uploading it to "
+                    + selectedPort + L"...";
+            }
+            if (!g_appClosing.load()) PostMessage(window, WM_APP + 21, 0, 0);
+            success = compileAndUploadSketchWithArduinoCli(
+                cli, selectedPort, sketchPath, exitCode, error);
+        }
+        if (deleteAfterFlash) {
+            DeleteFileW(sketchPath.c_str());
+            const size_t slash = sketchPath.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) {
+                RemoveDirectoryW(sketchPath.substr(0, slash).c_str());
+            }
+        }
+        {
+            lock_guard<mutex> lock(g_firmwareMutex);
+            g_firmwareStatus = success
+                ? L"Firmware compiled and flashed. Reconnecting..."
+                : L"Arduino CLI flash failed: " + utf8ToWide(error);
+        }
+        g_firmwareStage = 0;
+        g_flashing = false;
+        if (!g_appClosing.load()) PostMessage(window, WM_APP + 22, 1, success ? 1 : 0);
+    });
+}
+
+std::wstring downloadedFirmwarePath() {
+    wchar_t temporaryDirectory[MAX_PATH] = {};
+    if (!GetTempPathW(MAX_PATH, temporaryDirectory)) return L"haptic_latest_firmware.bin";
+    return std::wstring(temporaryDirectory) + L"haptic_latest_firmware.bin";
+}
+
+std::wstring downloadedSketchPath() {
+    wchar_t temporaryDirectory[MAX_PATH] = {};
+    std::wstring directory = GetTempPathW(MAX_PATH, temporaryDirectory)
+        ? std::wstring(temporaryDirectory) + L"HapticBrakeRelease"
+        : L"HapticBrakeRelease";
+    CreateDirectoryW(directory.c_str(), nullptr);
+    return directory + L"\\HapticBrakeRelease.ino";
+}
+
+void beginReleaseFlash(HWND window, bool updateConnectedDevice) {
+    if (g_updateChecking.load() || g_flashing.exchange(true)) return;
+
+    std::wstring selectedPort;
+    if (updateConnectedDevice) {
+        if (!isConnected.load() || g_serialPortName[0] == '\0') {
+            g_flashing = false;
+            MessageBoxW(window, L"Connect a recognized haptic controller first.",
+                        L"Firmware Update", MB_ICONWARNING);
+            return;
+        }
+        selectedPort = utf8ToWide(g_serialPortName);
+    } else {
+        wchar_t port[32] = {};
+        GetWindowTextW(hComboPorts, port, 32);
+        if (!g_manualFlashPortSelected || port[0] == L'\0') {
+            g_flashing = false;
+            MessageBoxW(window, L"Select an available COM port first.",
+                        L"Manual Flash", MB_ICONWARNING);
+            return;
+        }
+        selectedPort = port;
+    }
+
+    {
+        lock_guard<mutex> lock(g_firmwareMutex);
+        const bool metadataAlreadyLoaded = g_latestFirmware != L"Not checked";
+        const bool hasSketch = !g_latestFirmwareSketchUrl.empty();
+        const bool releaseCannotFlash = (g_latestFirmwareUrl.empty() && !hasSketch)
+            || (!updateConnectedDevice && !g_latestSupportsBlankBoard && !hasSketch);
+        if (metadataAlreadyLoaded && releaseCannotFlash) {
+            g_firmwareStatus = g_latestFirmwareUrl.empty() && !hasSketch
+                ? L"Latest release has no .bin or .ino firmware asset."
+                : L"Blank-board flashing needs a full .bin or an .ino release asset.";
+            g_flashing = false;
+            InvalidateRect(window, nullptr, FALSE);
+            return;
+        }
+    }
+
+    if (g_flashThread.joinable()) g_flashThread.join();
+    g_firmwareStage = 1;
+    g_downloadProgress = 0;
+    {
+        lock_guard<mutex> lock(g_firmwareMutex);
+        g_firmwareStatus = L"Loading the latest firmware release...";
+    }
+    g_flashThread = thread([window, selectedPort, updateConnectedDevice] {
+        std::string binaryUrl;
+        std::string sketchUrl;
+        DWORD flashOffset = 0;
+        bool supportsBlankBoard = false;
+        {
+            lock_guard<mutex> lock(g_firmwareMutex);
+            binaryUrl = g_latestFirmwareUrl;
+            sketchUrl = g_latestFirmwareSketchUrl;
+            flashOffset = g_latestFirmwareOffset;
+            supportsBlankBoard = g_latestSupportsBlankBoard;
+        }
+        if (binaryUrl.empty() && sketchUrl.empty()) {
+            FirmwareRelease release = fetchLatestFirmwareRelease();
+            lock_guard<mutex> lock(g_firmwareMutex);
+            if (release.ok) {
+                g_latestFirmware = utf8ToWide(release.version);
+                g_latestFirmwareUrl = release.binaryUrl;
+                g_latestFirmwareSketchUrl = release.sketchUrl;
+                g_latestFirmwareOffset = release.flashOffset;
+                g_latestSupportsBlankBoard = release.supportsBlankBoard;
+                binaryUrl = release.binaryUrl;
+                sketchUrl = release.sketchUrl;
+                flashOffset = release.flashOffset;
+                supportsBlankBoard = release.supportsBlankBoard;
+            } else {
+                g_firmwareStatus = L"Update check failed: " + utf8ToWide(release.error);
+            }
+        }
+
+        const bool useSketch = binaryUrl.empty()
+            || (!updateConnectedDevice && !supportsBlankBoard);
+        std::string error;
+        const std::wstring destination = useSketch
+            ? downloadedSketchPath() : downloadedFirmwarePath();
+        if (useSketch && sketchUrl.empty()) {
+            binaryUrl.clear();
+            error = "Blank-board flashing requires a full .bin or an .ino asset.";
+        }
+        const std::string selectedUrl = useSketch ? sketchUrl : binaryUrl;
+        bool downloaded = !selectedUrl.empty()
+            && downloadFirmwareBinary(selectedUrl, destination, &g_downloadProgress, error);
+        if (!downloaded) {
+            lock_guard<mutex> lock(g_firmwareMutex);
+            if (selectedUrl.empty()) {
+                g_firmwareStatus = L"Latest release has no usable .bin or .ino firmware asset.";
+            } else {
+                g_firmwareStatus = L"Firmware download failed: " + utf8ToWide(error);
+            }
+            g_firmwareStage = 0;
+            g_flashing = false;
+            if (!g_appClosing.load()) PostMessage(window, WM_APP + 21, 0, 0);
+            return;
+        }
+
+        if (g_appClosing.load()) {
+            DeleteFileW(destination.c_str());
+            g_firmwareStage = 0;
+            g_flashing = false;
+            return;
+        }
+        {
+            lock_guard<mutex> lock(g_firmwareMutex);
+            g_pendingFirmwarePath = destination;
+            g_pendingFirmwarePort = selectedPort;
+            g_pendingFirmwareIsTemporary = true;
+            g_pendingFirmwareUsesArduinoCli = useSketch;
+            g_pendingFirmwareOffset = flashOffset;
+            g_firmwareStatus = useSketch
+                ? L"Arduino source downloaded. Preparing Arduino CLI..."
+                : L"Firmware downloaded. Preparing the ESP32...";
+        }
+        PostMessage(window, WM_APP + 23, 0, 0);
+    });
+}
+
+int sliderValueFromX(int x) {
+    return clamp((x - 58) * 100 / (657 - 58), 0, 100);
+}
+
+void setSliderValue(int slider, int x) {
+    const int value = sliderValueFromX(x);
+    if (slider == 0) g_settings.masterVolume = value;
+    else if (slider == 1) g_settings.absPulse = value;
+    else if (slider == 2) g_settings.roadTexture = value;
+    else if (slider == 3) g_settings.tireSlip = value;
+    applyEffectSettings();
+}
+
+void enablePerMonitorDpiAwareness() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    using SetDpiContext = BOOL(WINAPI*)(HANDLE);
+    SetDpiContext setContext = nullptr;
+    FARPROC setContextAddress = GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+    static_assert(sizeof(setContext) == sizeof(setContextAddress));
+    memcpy(&setContext, &setContextAddress, sizeof(setContext));
+    if (!setContext || !setContext(reinterpret_cast<HANDLE>(-4))) {
+        SetProcessDPIAware();
+    }
+}
+
+UINT dpiForWindowOrSystem(HWND window = nullptr) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    using GetWindowDpi = UINT(WINAPI*)(HWND);
+    GetWindowDpi getWindowDpi = nullptr;
+    FARPROC getDpiAddress = GetProcAddress(user32, "GetDpiForWindow");
+    static_assert(sizeof(getWindowDpi) == sizeof(getDpiAddress));
+    memcpy(&getWindowDpi, &getDpiAddress, sizeof(getWindowDpi));
+    if (window && getWindowDpi) return getWindowDpi(window);
+
+    HDC screen = GetDC(nullptr);
+    const UINT dpi = screen ? static_cast<UINT>(GetDeviceCaps(screen, LOGPIXELSX)) : 96;
+    if (screen) ReleaseDC(nullptr, screen);
+    return dpi > 0 ? dpi : 96;
+}
+
+SIZE scaledWindowSize(UINT dpi, const RECT& workArea) {
+    SIZE result{
+        MulDiv(UI_LOGICAL_WIDTH, static_cast<int>(dpi), 96),
+        MulDiv(UI_LOGICAL_HEIGHT, static_cast<int>(dpi), 96)
+    };
+    const int maximumWidth = (workArea.right - workArea.left) * 9 / 10;
+    const int maximumHeight = (workArea.bottom - workArea.top) * 9 / 10;
+    if (result.cx > maximumWidth || result.cy > maximumHeight) {
+        const double fit = min(static_cast<double>(maximumWidth) / result.cx,
+                               static_cast<double>(maximumHeight) / result.cy);
+        result.cx = max(1, static_cast<int>(result.cx * fit));
+        result.cy = max(1, static_cast<int>(result.cy * fit));
+    }
+    return result;
+}
+
+POINT clientToDesign(HWND window, int x, int y) {
+    RECT client = {};
+    GetClientRect(window, &client);
+    return POINT{
+        client.right > 0 ? MulDiv(x, UI_DESIGN_WIDTH, client.right) : x,
+        client.bottom > 0 ? MulDiv(y, UI_DESIGN_HEIGHT, client.bottom) : y
+    };
 }
 
 // Window Procedure
-LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
+
+LRESULT CALLBACK ModernWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
         case WM_CREATE: {
-            INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX), ICC_PROGRESS_CLASS };
-            InitCommonControlsEx(&icex);
-
-            // Dark Titlebar Windows 10/11
+            INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_STANDARD_CLASSES};
+            InitCommonControlsEx(&controls);
             BOOL darkMode = TRUE;
-            DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkMode, sizeof(darkMode));
+            DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                                  &darkMode, sizeof(darkMode));
 
-            // Fonts
-            hFontRegular = CreateFontA(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-            hFontBold    = CreateFontA(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-            hFontTitle   = CreateFontA(-15, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-            hFontStatus  = CreateFontA(-13, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+            hFontRegular = CreateFontW(-21, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, regularUiFontFamily());
+            hFontBold = CreateFontW(-21, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, mediumUiFontFamily());
+            hFontSmall = CreateFontW(-17, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, regularUiFontFamily());
+            hFontPageTitle = CreateFontW(-28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, mediumUiFontFamily());
+            hFontHero = CreateFontW(-32, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, mediumUiFontFamily());
+            hFontValue = CreateFontW(-23, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, mediumUiFontFamily());
 
-            // Brushes
-            hBrushBg          = CreateSolidBrush(RGB(18, 18, 20));    // #121214
-            hBrushCard        = CreateSolidBrush(RGB(24, 24, 28));    // #18181C
-            hBrushBtnDark     = CreateSolidBrush(RGB(42, 42, 50));    // #2A2A32
-            hBrushActiveAbs   = CreateSolidBrush(RGB(255, 23, 68));   // #FF1744
-            hBrushInactiveAbs = CreateSolidBrush(RGB(30, 30, 36));   // #1E1E24
-            hBrushPanicBg     = CreateSolidBrush(RGB(180, 0, 0));    // Dark Red for panic
-
-            // --- Card 1: Connection Settings ---
-            HWND hTitle1 = CreateWindowA("STATIC", "  ESP32 + Simulator Connection", WS_CHILD | WS_VISIBLE, 20, 14, 460, 22, hWnd, NULL, hInst, NULL);
-            SendMessage(hTitle1, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
-
-            HWND hLblCom = CreateWindowA("STATIC", "Auto scan:", WS_CHILD | WS_VISIBLE, 32, 48, 75, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblCom, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-
-            hComboPorts = CreateWindowA("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 115, 45, 115, 150, hWnd, (HMENU)IDC_COMBO_PORTS, hInst, NULL);
-            SendMessage(hComboPorts, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-            
-            hBtnRefresh = CreateWindowA("BUTTON", "Refresh", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 240, 44, 85, 28, hWnd, (HMENU)IDC_BTN_REFRESH, hInst, NULL);
-            hBtnConnect = CreateWindowA("BUTTON", "Connect", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 335, 44, 130, 28, hWnd, (HMENU)IDC_BTN_CONNECT, hInst, NULL);
-
-            hLblSerialStat = CreateWindowA("STATIC", "ESP32: [DISCONNECTED]", WS_CHILD | WS_VISIBLE, 32, 84, 420, 20, hWnd, (HMENU)IDC_LBL_SERIAL_STAT, hInst, NULL);
-            SendMessage(hLblSerialStat, WM_SETFONT, (WPARAM)hFontStatus, TRUE);
-
-            hLblGameStat   = CreateWindowA("STATIC", "AC / ACC: [CHECKING...]", WS_CHILD | WS_VISIBLE, 32, 108, 290, 20, hWnd, (HMENU)IDC_LBL_GAME_STAT, hInst, NULL);
-            SendMessage(hLblGameStat, WM_SETFONT, (WPARAM)hFontStatus, TRUE);
-
-            hLblFPS        = CreateWindowA("STATIC", "Stream: 0 Hz", WS_CHILD | WS_VISIBLE | SS_RIGHT, 330, 108, 135, 20, hWnd, (HMENU)IDC_LBL_FPS, hInst, NULL);
-            SendMessage(hLblFPS, WM_SETFONT, (WPARAM)hFontStatus, TRUE);
-
-            // --- Card 2: Live Telemetry Dashboard ---
-            HWND hTitle2 = CreateWindowA("STATIC", "  AC High-rate / ACC 60 Hz / Serial 60 Hz", WS_CHILD | WS_VISIBLE, 20, 150, 460, 22, hWnd, NULL, hInst, NULL);
-            SendMessage(hTitle2, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
-
-            // Brake
-            HWND hLblBrk = CreateWindowA("STATIC", "Brake Input:", WS_CHILD | WS_VISIBLE, 32, 182, 85, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblBrk, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-
-            hPrgBrake = CreateWindowA(PROGRESS_CLASSA, "", WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 125, 182, 260, 18, hWnd, (HMENU)IDC_PRG_BRAKE, hInst, NULL);
-            SetWindowTheme(hPrgBrake, L"", L"");
-            SendMessage(hPrgBrake, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-            SendMessage(hPrgBrake, PBM_SETBARCOLOR, 0, (LPARAM)RGB(255, 107, 0)); // Neon Orange
-            SendMessage(hPrgBrake, PBM_SETBKCOLOR, 0, (LPARAM)RGB(35, 35, 42));
-
-            hLblBrakeVal = CreateWindowA("STATIC", "0%", WS_CHILD | WS_VISIBLE | SS_RIGHT, 395, 182, 70, 20, hWnd, (HMENU)IDC_LBL_BRAKE_VAL, hInst, NULL);
-            SendMessage(hLblBrakeVal, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-
-            // ABS
-            HWND hLblAbs = CreateWindowA("STATIC", "ABS Pulse:", WS_CHILD | WS_VISIBLE, 32, 214, 85, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblAbs, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-
-            hLblAbsStat = CreateWindowA("STATIC", "  [ OFF ]  ", WS_CHILD | WS_VISIBLE | SS_CENTER, 125, 212, 130, 24, hWnd, (HMENU)IDC_LBL_ABS_STAT, hInst, NULL);
-            SendMessage(hLblAbsStat, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-
-            // Tire Slip
-            HWND hLblSlp = CreateWindowA("STATIC", "Long SlipRatio:", WS_CHILD | WS_VISIBLE, 32, 248, 92, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblSlp, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-
-            hPrgSlipL = CreateWindowA(PROGRESS_CLASSA, "", WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 125, 248, 125, 16, hWnd, (HMENU)IDC_PRG_SLIP_L, hInst, NULL);
-            hPrgSlipR = CreateWindowA(PROGRESS_CLASSA, "", WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 260, 248, 125, 16, hWnd, (HMENU)IDC_PRG_SLIP_R, hInst, NULL);
-            SetWindowTheme(hPrgSlipL, L"", L"");
-            SetWindowTheme(hPrgSlipR, L"", L"");
-            SendMessage(hPrgSlipL, PBM_SETRANGE, 0, MAKELPARAM(0, 200));
-            SendMessage(hPrgSlipR, PBM_SETRANGE, 0, MAKELPARAM(0, 200));
-            SendMessage(hPrgSlipL, PBM_SETBARCOLOR, 0, (LPARAM)RGB(0, 229, 255)); // Cyan
-            SendMessage(hPrgSlipR, PBM_SETBARCOLOR, 0, (LPARAM)RGB(0, 229, 255));
-            SendMessage(hPrgSlipL, PBM_SETBKCOLOR, 0, (LPARAM)RGB(35, 35, 42));
-            SendMessage(hPrgSlipR, PBM_SETBKCOLOR, 0, (LPARAM)RGB(35, 35, 42));
-
-            hLblSlipVal = CreateWindowA("STATIC", "0.00 / 0.00", WS_CHILD | WS_VISIBLE | SS_RIGHT, 395, 248, 70, 20, hWnd, (HMENU)IDC_LBL_SLIP_VAL, hInst, NULL);
-            SendMessage(hLblSlipVal, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-
-            // Road intensity derived from normalized suspension velocity
-            HWND hLblSus = CreateWindowA("STATIC", "Road effect:", WS_CHILD | WS_VISIBLE, 32, 282, 85, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblSus, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-
-            hLblSusVal = CreateWindowA("STATIC", "FL: 0.000   |   FR: 0.000", WS_CHILD | WS_VISIBLE, 125, 282, 340, 20, hWnd, (HMENU)IDC_LBL_SUS_VAL, hInst, NULL);
-            SendMessage(hLblSusVal, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
-
-            // --- Card 3: ESP32 Health ---
-            HWND hTitle3 = CreateWindowA("STATIC", "  ESP32 Health Monitor", WS_CHILD | WS_VISIBLE, 20, 325, 460, 22, hWnd, NULL, hInst, NULL);
-            SendMessage(hTitle3, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
-
-            hLblPanicStat = CreateWindowA("STATIC", "  ESP32 Status: OK", WS_CHILD | WS_VISIBLE, 32, 355, 430, 22, hWnd, (HMENU)IDC_LBL_PANIC_STAT, hInst, NULL);
-            SendMessage(hLblPanicStat, WM_SETFONT, (WPARAM)hFontStatus, TRUE);
-
-            // --- Card 4: Raw Telemetry Data ---
-            HWND hTitle4 = CreateWindowA("STATIC", "  Raw Telemetry Data", WS_CHILD | WS_VISIBLE, 20, 530, 460, 22, hWnd, NULL, hInst, NULL);
-            SendMessage(hTitle4, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
-
-            hLblRawBrake = CreateWindowA("STATIC", "Brake: 0.0000", WS_CHILD | WS_VISIBLE, 32, 560, 140, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblRawBrake, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
-
-            hLblRawAbs = CreateWindowA("STATIC", "ABS signal: 0.0000", WS_CHILD | WS_VISIBLE, 180, 560, 140, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblRawAbs, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
-
-            hLblRawSlipL = CreateWindowA("STATIC", "Ratio FL: 0.0000", WS_CHILD | WS_VISIBLE, 32, 585, 140, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblRawSlipL, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
-
-            hLblRawSlipR = CreateWindowA("STATIC", "Ratio FR: 0.0000", WS_CHILD | WS_VISIBLE, 180, 585, 140, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblRawSlipR, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
-
-            hLblRawSusL = CreateWindowA("STATIC", "RoadL: 0.0000", WS_CHILD | WS_VISIBLE, 32, 610, 140, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblRawSusL, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
-
-            hLblRawSusR = CreateWindowA("STATIC", "RoadR: 0.0000", WS_CHILD | WS_VISIBLE, 180, 610, 140, 20, hWnd, NULL, hInst, NULL);
-            SendMessage(hLblRawSusR, WM_SETFONT, (WPARAM)hFontRegular, TRUE);
-
-            refreshPortList();
-            SetTimer(hWnd, 1, 33, NULL);
-            break;
+            g_settings = loadAppSettings();
+            applyEffectSettings();
+            hComboPorts = CreateWindowExW(0, L"COMBOBOX", L"",
+                WS_CHILD | CBS_DROPDOWNLIST,
+                -1000, -1000, 10, 10, window, reinterpret_cast<HMENU>(IDC_COMBO_PORTS),
+                hInst, nullptr);
+            SendMessage(hComboPorts, WM_SETFONT, reinterpret_cast<WPARAM>(hFontRegular), TRUE);
+            SetWindowTheme(hComboPorts, L"DarkMode_CFD", nullptr);
+            updateFirmwareControls();
+            addTrayIcon(window);
+            SetTimer(window, 1, 33, nullptr);
+            startConnection();
+            return 0;
         }
 
-        case WM_CTLCOLORSTATIC: {
-            HDC hdc = (HDC)wParam;
-            HWND hCtl = (HWND)lParam;
-            SetBkMode(hdc, TRANSPARENT);
-
-            if (hCtl == hLblPanicStat) {
-                if (g_esp32Panicked.load()) {
-                    SetTextColor(hdc, RGB(255, 255, 255));
-                    return (INT_PTR)hBrushPanicBg;
-                } else {
-                    SetTextColor(hdc, RGB(0, 230, 118));
-                    return (INT_PTR)hBrushCard;
-                }
-            } else if (hCtl == hLblAbsStat) {
-                if (g_live.absVal.load() >= 0.5f) {
-                    SetTextColor(hdc, RGB(255, 255, 255));
-                    return (INT_PTR)hBrushActiveAbs;
-                } else {
-                    SetTextColor(hdc, RGB(90, 90, 100));
-                    return (INT_PTR)hBrushInactiveAbs;
-                }
-            } else if (hCtl == hLblBrakeVal) {
-                SetTextColor(hdc, RGB(255, 107, 0));
-            } else if (hCtl == hLblSlipVal || hCtl == hLblFPS) {
-                SetTextColor(hdc, RGB(0, 229, 255));
-            } else if (hCtl == hLblSerialStat) {
-                SetTextColor(hdc, isConnected ? RGB(0, 230, 118) : RGB(140, 140, 150));
-            } else if (hCtl == hLblGameStat) {
-                int st = g_live.acState.load();
-                SetTextColor(hdc, (st == 2) ? RGB(0, 230, 118) : ((st == 1) ? RGB(255, 214, 0) : RGB(140, 140, 150)));
-            } else {
-                SetTextColor(hdc, RGB(220, 220, 230));
-            }
-            return (INT_PTR)hBrushCard;
-        }
-
-        case WM_CTLCOLORDLG:
-            return (INT_PTR)hBrushBg;
-
-        case WM_DRAWITEM: {
-            LPDRAWITEMSTRUCT pDIS = (LPDRAWITEMSTRUCT)lParam;
-            HDC hdc = pDIS->hDC;
-            RECT rc = pDIS->rcItem;
-
-            if (pDIS->CtlID == IDC_BTN_CONNECT) {
-                COLORREF btnColor = isRunning ? RGB(211, 47, 47) : RGB(255, 107, 0);
-                HBRUSH hBtnBrush = CreateSolidBrush(btnColor);
-                FillRect(hdc, &rc, hBtnBrush);
-                DeleteObject(hBtnBrush);
-
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, RGB(255, 255, 255));
-                SelectObject(hdc, hFontBold);
-
-                const wchar_t* text = isRunning ? L"[X] DISCONNECT" : L"[>] CONNECT";
-                DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                return TRUE;
-            } else if (pDIS->CtlID == IDC_BTN_REFRESH) {
-                FillRect(hdc, &rc, hBrushBtnDark);
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, RGB(220, 220, 230));
-                SelectObject(hdc, hFontBold);
-                DrawTextW(hdc, L"Refresh", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                return TRUE;
-            }
-            break;
-        }
+        case WM_ERASEBKGND:
+            return 1;
 
         case WM_PAINT: {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hWnd, &ps);
-
-            RECT rcClient;
-            GetClientRect(hWnd, &rcClient);
-            FillRect(hdc, &rcClient, hBrushBg);
-
-            RECT rcCard1 = { 16, 12, 480, 135 };
-            FillRect(hdc, &rcCard1, hBrushCard);
-            FrameRect(hdc, &rcCard1, hBrushBtnDark);
-
-            RECT rcCard2 = { 16, 145, 480, 315 };
-            FillRect(hdc, &rcCard2, hBrushCard);
-            FrameRect(hdc, &rcCard2, hBrushBtnDark);
-
-            RECT rcCard3 = { 16, 320, 480, 390 };
-            FillRect(hdc, &rcCard3, hBrushCard);
-            FrameRect(hdc, &rcCard3, hBrushBtnDark);
-
-            RECT rcCard4 = { 16, 525, 480, 640 };
-            FillRect(hdc, &rcCard4, hBrushCard);
-            FrameRect(hdc, &rcCard4, hBrushBtnDark);
-
-            EndPaint(hWnd, &ps);
-            break;
+            PAINTSTRUCT paint = {};
+            HDC dc = BeginPaint(window, &paint);
+            RECT client = {};
+            GetClientRect(window, &client);
+            const int clientWidth = max(1L, client.right - client.left);
+            const int clientHeight = max(1L, client.bottom - client.top);
+            HDC buffer = CreateCompatibleDC(dc);
+            HBITMAP bitmap = CreateCompatibleBitmap(dc, clientWidth, clientHeight);
+            HGDIOBJ oldBitmap = SelectObject(buffer, bitmap);
+            SetMapMode(buffer, MM_ANISOTROPIC);
+            SetWindowExtEx(buffer, UI_DESIGN_WIDTH, UI_DESIGN_HEIGHT, nullptr);
+            SetViewportExtEx(buffer, clientWidth, clientHeight, nullptr);
+            modern_ui::Fonts fonts{hFontRegular, hFontBold, hFontSmall,
+                                   hFontPageTitle, hFontHero, hFontValue};
+            modern_ui::draw(buffer, currentDrawModel(), fonts);
+            SetMapMode(buffer, MM_TEXT);
+            BitBlt(dc, 0, 0, clientWidth, clientHeight, buffer, 0, 0, SRCCOPY);
+            SelectObject(buffer, oldBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(buffer);
+            EndPaint(window, &paint);
+            return 0;
         }
 
-        case WM_COMMAND: {
-            int wmId = LOWORD(wParam);
-            if (wmId == IDC_BTN_REFRESH) {
-                refreshPortList();
-            } else if (wmId == IDC_BTN_CONNECT) {
-                if (!isRunning) {
-                    g_serialPortName[0] = '\0';
-                    g_hapticDeviceId[0] = '\0';
-                    isRunning = true;
-                    g_serialStatus = 0;
-                    g_prevSerialStatus = -1;
-                    g_esp32Panicked = false;
-                    g_panicMsgBoxShown = false;
-                    g_pauseSerialWrites = false;
-                    g_panicMessage[0] = '\0';
-                    if (workerThread.joinable()) workerThread.join();
-                    if (serialMonitorThread.joinable()) serialMonitorThread.join();
-                    closeSerial();
-                    workerThread = thread(telemetryWorker);
-                    serialMonitorThread = thread(serialMonitorWorker);
-                } else {
-                    isRunning = false;
-                    if (workerThread.joinable()) workerThread.join();
-                    if (serialMonitorThread.joinable()) serialMonitorThread.join();
-                    closeSerial();
-                }
+        case WM_NCHITTEST: {
+            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ScreenToClient(window, &point);
+            point = clientToDesign(window, point.x, point.y);
+            if (point.y >= 0 && point.y < 72
+                && !modern_ui::contains(modern_ui::rect(610, 10, 710, 65), point.x, point.y)) {
+                return HTCAPTION;
             }
-            break;
+            return HTCLIENT;
         }
+
+        case WM_LBUTTONDOWN: {
+            SetCapture(window);
+            const POINT design = clientToDesign(
+                window, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            const int x = design.x;
+            const int y = design.y;
+            if (modern_ui::contains(modern_ui::rect(610, 10, 662, 65), x, y)) {
+                ReleaseCapture();
+                ShowWindow(window, SW_MINIMIZE);
+                return 0;
+            }
+            if (modern_ui::contains(modern_ui::rect(665, 10, 715, 65), x, y)) {
+                ReleaseCapture();
+                SendMessage(window, WM_CLOSE, 0, 0);
+                return 0;
+            }
+            if (y >= 72 && y < 132) {
+                g_activePage = clamp(x / 180, 0, 3);
+                updateFirmwareControls();
+                InvalidateRect(window, nullptr, FALSE);
+                ReleaseCapture();
+                return 0;
+            }
+
+            if (g_activePage == 0
+                && modern_ui::contains(modern_ui::rect(350, 705, 678, 785), x, y)) {
+                g_activePage = 2;
+                updateFirmwareControls();
+                InvalidateRect(window, nullptr, FALSE);
+            } else if (g_activePage == 1) {
+                const int sliderY[] = {260, 422, 584, 746};
+                for (int index = 0; index < 4; ++index) {
+                    if (x >= 45 && x <= 670 && abs(y - sliderY[index]) <= 24) {
+                        g_dragSlider = index;
+                        setSliderValue(index, x);
+                        InvalidateRect(window, nullptr, FALSE);
+                        break;
+                    }
+                }
+            } else if (g_activePage == 2) {
+                if (modern_ui::contains(modern_ui::rect(385, 360, 510, 397), x, y)) {
+                    beginUpdateCheck(window);
+                } else if (modern_ui::contains(modern_ui::rect(520, 360, 665, 397), x, y)) {
+                    beginReleaseFlash(window, true);
+                } else if (modern_ui::contains(modern_ui::rect(55, 594, 665, 637), x, y)) {
+                    showPortSelector(window);
+                } else if (modern_ui::contains(modern_ui::rect(385, 745, 665, 805), x, y)) {
+                    beginReleaseFlash(window, false);
+                }
+            } else if (g_activePage == 3) {
+                if (modern_ui::contains(modern_ui::rect(575, 260, 680, 338), x, y)) {
+                    const bool next = !g_settings.startWithWindows;
+                    if (setStartWithWindows(next)) {
+                        g_settings.startWithWindows = next;
+                        persistSettings();
+                    } else {
+                        MessageBoxW(window, L"Windows startup registration could not be changed.",
+                                    L"Settings", MB_ICONERROR);
+                    }
+                } else if (modern_ui::contains(modern_ui::rect(575, 385, 680, 465), x, y)) {
+                    g_settings.minimizeToTray = !g_settings.minimizeToTray;
+                    persistSettings();
+                } else if (modern_ui::contains(modern_ui::rect(485, 535, 665, 585), x, y)) {
+                    ShellExecuteW(window, L"open",
+                        L"https://github.com/tminh-U/DIY-Haptic-Motor-for-Pedals",
+                        nullptr, nullptr, SW_SHOWNORMAL);
+                }
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_MOUSEMOVE:
+            if (g_dragSlider >= 0 && (wParam & MK_LBUTTON)) {
+                const POINT design = clientToDesign(
+                    window, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                setSliderValue(g_dragSlider, design.x);
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+
+        case WM_DPICHANGED: {
+            const UINT dpi = HIWORD(wParam);
+            const RECT suggested = *reinterpret_cast<RECT*>(lParam);
+            HMONITOR monitor = MonitorFromRect(&suggested, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO info = {};
+            info.cbSize = sizeof(info);
+            GetMonitorInfoW(monitor, &info);
+            const SIZE size = scaledWindowSize(dpi, info.rcWork);
+            const int x = clamp(suggested.left, info.rcWork.left,
+                                max(info.rcWork.left, info.rcWork.right - size.cx));
+            const int y = clamp(suggested.top, info.rcWork.top,
+                                max(info.rcWork.top, info.rcWork.bottom - size.cy));
+            SetWindowPos(window, nullptr, x, y, size.cx, size.cy,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_LBUTTONUP:
+            if (g_dragSlider >= 0) saveAppSettings(g_settings);
+            g_dragSlider = -1;
+            ReleaseCapture();
+            return 0;
+
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDC_COMBO_PORTS && HIWORD(wParam) == CBN_DROPDOWN) {
+                refreshPortList();
+            } else if (LOWORD(wParam) == 9001) {
+                ShowWindow(window, SW_SHOW);
+                SetForegroundWindow(window);
+            } else if (LOWORD(wParam) == 9002) {
+                g_settings.minimizeToTray = false;
+                DestroyWindow(window);
+            } else if (LOWORD(wParam) >= 9100 && LOWORD(wParam) < 9200) {
+                const int selection = LOWORD(wParam) - 9100;
+                SendMessage(hComboPorts, CB_SETCURSEL, selection, 0);
+                g_manualFlashPortSelected = true;
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_APMSUSPEND) {
+                g_powerSuspended = true;
+                stopConnection();
+                clearLiveTelemetry();
+                g_serialStatus = 3;
+                InvalidateRect(window, nullptr, FALSE);
+                return TRUE;
+            }
+            if (wParam == PBT_APMRESUMEAUTOMATIC
+                || wParam == PBT_APMRESUMESUSPEND
+                || wParam == PBT_APMRESUMECRITICAL) {
+                g_powerSuspended = false;
+                g_reconnectNotBefore = GetTickCount64() + 1500;
+                SetTimer(window, 2, 1500, nullptr);
+                InvalidateRect(window, nullptr, FALSE);
+                return TRUE;
+            }
+            return TRUE;
+
+        case WM_DEVICECHANGE:
+            if (wParam == DBT_DEVNODES_CHANGED
+                || wParam == DBT_DEVICEREMOVECOMPLETE
+                || wParam == DBT_DEVICEARRIVAL) {
+                bool connectedPortPresent = false;
+                if (g_serialPortName[0] != '\0') {
+                    for (const std::string& port : getAvailableCOMPorts()) {
+                        if (_stricmp(port.c_str(), g_serialPortName) == 0) {
+                            connectedPortPresent = true;
+                            break;
+                        }
+                    }
+                }
+                if (isConnected.load() && !connectedPortPresent) {
+                    signalSerialDisconnect();
+                }
+                if (!g_powerSuspended.load()) {
+                    g_reconnectNotBefore = GetTickCount64() + 500;
+                    SetTimer(window, 2, 500, nullptr);
+                }
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return TRUE;
 
         case WM_TIMER: {
-            if (wParam == 1) {
-                // --- Handle serial status changes from worker thread (thread-safe) ---
-                int ss = g_serialStatus.load();
-                if (ss != g_prevSerialStatus) {
-                    g_prevSerialStatus = ss;
-                    if (ss == 0 && isRunning) { // Discovery in progress
-                        SetWindowTextA(hLblSerialStat, "ESP32: [SEARCHING FOR HAPTIC DEVICE...]");
-                        EnableWindow(hComboPorts, FALSE);
-                        EnableWindow(hBtnRefresh, FALSE);
-                    } else if (ss == 1) { // Connected
-                        char statusBuf[160];
-                        sprintf_s(statusBuf, "ESP32: [AUTO CONNECTED] %s - %s", g_serialPortName, g_hapticDeviceId);
-                        SetWindowTextA(hLblSerialStat, statusBuf);
-                        EnableWindow(hComboPorts, FALSE);
-                        EnableWindow(hBtnRefresh, FALSE);
-                    } else if (ss == 2) { // Failed
-                        char statusBuf[128];
-                        sprintf_s(statusBuf, "ESP32: [FAILED TO OPEN %s]", g_serialPortName);
-                        SetWindowTextA(hLblSerialStat, statusBuf);
-                        EnableWindow(hComboPorts, TRUE);
-                        EnableWindow(hBtnRefresh, TRUE);
-                    } else if (ss == 4) { // No matching firmware identity
-                        SetWindowTextA(hLblSerialStat, "ESP32: [HAPTIC DEVICE NOT FOUND]");
-                        EnableWindow(hComboPorts, TRUE);
-                        EnableWindow(hBtnRefresh, TRUE);
-                    } else if (ss == 3) { // Disconnected
-                        SetWindowTextA(hLblSerialStat, "ESP32: [DISCONNECTED]");
-                        EnableWindow(hComboPorts, TRUE);
-                        EnableWindow(hBtnRefresh, TRUE);
-                    }
-                    InvalidateRect(hBtnConnect, NULL, TRUE);
-                }
-
-                // Check the simulator even before connecting to ESP32.
-                if (!isRunning) {
-                    static DWORD lastGameProbeTick = 0;
-                    DWORD nowTick = GetTickCount();
-                    if (nowTick - lastGameProbeTick >= 500) {
-                        GameKind detectedGame = detectRunningGame();
-                        g_live.gameKind = static_cast<int>(detectedGame);
-                        g_live.acState = (detectedGame == GameKind::None) ? 0 : 1;
-                        lastGameProbeTick = nowTick;
-                    }
-                }
-
-                // Update simulator status.
-                int acState = g_live.acState.load();
-                GameKind gameKind = static_cast<GameKind>(g_live.gameKind.load());
-                if (acState == 2) {
-                    SetWindowTextA(hLblGameStat, gameKind == GameKind::ACC
-                        ? "ACC Shared Memory: [RECEIVING]"
-                        : "AC Python API: [RECEIVING]");
-                } else if (acState == 1) {
-                    SetWindowTextA(hLblGameStat, gameKind == GameKind::ACC
-                        ? "ACC: [WAITING FOR SHARED MEMORY]"
-                        : "AC: [WAITING FOR PYTHON APP]");
-                } else {
-                    SetWindowTextA(hLblGameStat, "AC / ACC: [NOT DETECTED]");
-                }
-
-                // Stream Rate
-                int fps = g_live.fps.load();
-                char fpsBuf[32];
-                sprintf_s(fpsBuf, "Stream: %d Hz", fps);
-                SetWindowTextA(hLblFPS, fpsBuf);
-
-                // Update Live Telemetry
-                float brake = g_live.brake.load();
-                float slipL = g_live.slipL.load();
-                float slipR = g_live.slipR.load();
-                float susL = g_live.susL.load();
-                float susR = g_live.susR.load();
-
-                // Brake
-                int brakePercent = (int)(brake * 100.0f);
-                SendMessage(hPrgBrake, PBM_SETPOS, brakePercent, 0);
-                char brakeBuf[16];
-                sprintf_s(brakeBuf, "%d%%", brakePercent);
-                SetWindowTextA(hLblBrakeVal, brakeBuf);
-
-                // AC derives ABS from SlipRatio; ACC uses its native `abs` signal.
-                if (g_live.absVal.load() >= 0.5f) {
-                    SetWindowTextA(hLblAbsStat, ">>> ABS ACTIVE <<<");
-                } else {
-                    SetWindowTextA(hLblAbsStat, "  [ OFF ]  ");
-                }
-                InvalidateRect(hLblAbsStat, NULL, TRUE);
-
-                // Slip
-                SendMessage(hPrgSlipL, PBM_SETPOS, (int)(slipL * 100.0f), 0);
-                SendMessage(hPrgSlipR, PBM_SETPOS, (int)(slipR * 100.0f), 0);
-                char slipBuf[32];
-                sprintf_s(slipBuf, "%.2f / %.2f", slipL, slipR);
-                SetWindowTextA(hLblSlipVal, slipBuf);
-
-                // Normalized road intensity
-                char susBuf[64];
-                sprintf_s(susBuf, "FL: %.3f   |   FR: %.3f", susL, susR);
-                SetWindowTextA(hLblSusVal, susBuf);
-
-                // ESP32 Panic Detection
-                if (g_esp32Panicked.load()) {
-                    char panicBuf[300];
-                    char firstLine[200] = {0};
-                    {
-                        lock_guard<mutex> lock(g_panicMutex);
-                        // Extract only the first line for the small UI label
-                        const char* newlinePos = strchr(g_panicMessage, '\n');
-                        if (newlinePos) {
-                            int len = min((int)(newlinePos - g_panicMessage), 199);
-                            strncpy(firstLine, g_panicMessage, len);
-                            firstLine[len] = '\0';
-                        } else {
-                            strncpy(firstLine, g_panicMessage, 199);
-                        }
-                        sprintf_s(panicBuf, "  [!] ESP32 CRASH: %s", firstLine);
-                    }
-                    SetWindowTextA(hLblPanicStat, panicBuf);
-                    InvalidateRect(hLblPanicStat, NULL, TRUE);
-
-                    // Show MessageBox only once per panic event
-                    if (!g_panicMsgBoxShown.exchange(true)) {
-                        char msgBuf[2500];
-                        {
-                            lock_guard<mutex> lock(g_panicMutex);
-                            sprintf_s(msgBuf, sizeof(msgBuf), "ESP32 has crashed (fatal panic)!\n\n%s\n\nPlease reset the ESP32.", g_panicMessage);
-                        }
-                        MessageBoxA(hWnd, msgBuf, "ESP32 Fatal Panic", MB_ICONERROR);
-                    }
-                } else if (isConnected.load()) {
-                    SetWindowTextA(hLblPanicStat, "  ESP32 Status: OK");
-                    InvalidateRect(hLblPanicStat, NULL, TRUE);
-                }
-
-                // Raw Data Update
-                float absVal = g_live.absVal.load();
-                char rawBuf[64];
-                sprintf_s(rawBuf, "Brake: %.4f", brake); SetWindowTextA(hLblRawBrake, rawBuf);
-                sprintf_s(rawBuf, "ABS signal: %.4f", absVal); SetWindowTextA(hLblRawAbs, rawBuf);
-                sprintf_s(rawBuf, "Ratio FL: %.4f", slipL); SetWindowTextA(hLblRawSlipL, rawBuf);
-                sprintf_s(rawBuf, "Ratio FR: %.4f", slipR); SetWindowTextA(hLblRawSlipR, rawBuf);
-                sprintf_s(rawBuf, "RoadL: %.4f", susL); SetWindowTextA(hLblRawSusL, rawBuf);
-                sprintf_s(rawBuf, "RoadR: %.4f", susR); SetWindowTextA(hLblRawSusR, rawBuf);
+            if (wParam == 2) {
+                KillTimer(window, 2);
             }
-            break;
+            if (g_esp32Panicked.load() && !g_panicMsgBoxShown.exchange(true)) {
+                std::string panic;
+                {
+                    lock_guard<mutex> lock(g_panicMutex);
+                    panic = g_panicMessage;
+                }
+                std::wstring messageText = L"ESP32 kernel panic detected.\n\n"
+                    + utf8ToWide(panic) + L"\n\nReset the ESP32 before continuing.";
+                MessageBoxW(window, messageText.c_str(), L"ESP32 Fatal Panic", MB_ICONERROR);
+            }
+            static ULONGLONG lastReconnectAttempt = 0;
+            static ULONGLONG lastGameProbe = 0;
+            const ULONGLONG now = GetTickCount64();
+            if (now - lastGameProbe >= 1000) {
+                g_detectedGameForUi = static_cast<int>(detectRunningGame());
+                lastGameProbe = now;
+            }
+            if (!isRunning.load() && !isConnected.load() && !g_flashing.load()
+                && !g_powerSuspended.load()
+                && (!g_esp32Panicked.load() || g_panicMsgBoxShown.load())
+                && now >= g_reconnectNotBefore.load()
+                && now - lastReconnectAttempt >= 3000) {
+                lastReconnectAttempt = now;
+                startConnection();
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
         }
 
-        case WM_DESTROY: {
-            KillTimer(hWnd, 1);
-            isRunning = false;
-            if (workerThread.joinable()) workerThread.join();
-            if (serialMonitorThread.joinable()) serialMonitorThread.join();
-            closeSerial();
+        case WM_APP + 21:
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
 
-            DeleteObject(hBrushBg);
-            DeleteObject(hBrushCard);
-            DeleteObject(hBrushBtnDark);
-            DeleteObject(hBrushActiveAbs);
-            DeleteObject(hBrushInactiveAbs);
-            DeleteObject(hBrushPanicBg);
+        case WM_APP + 22:
+            updateFirmwareControls();
+            if (wParam) startConnection();
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+
+        case WM_APP + 23: {
+            if (g_flashThread.joinable()) g_flashThread.join();
+            std::wstring downloadedPath;
+            std::wstring selectedPort;
+            bool temporary = false;
+            bool useArduinoCli = false;
+            DWORD flashOffset = 0;
+            {
+                lock_guard<mutex> lock(g_firmwareMutex);
+                downloadedPath = g_pendingFirmwarePath;
+                selectedPort = g_pendingFirmwarePort;
+                temporary = g_pendingFirmwareIsTemporary;
+                useArduinoCli = g_pendingFirmwareUsesArduinoCli;
+                flashOffset = g_pendingFirmwareOffset;
+                g_pendingFirmwarePath.clear();
+                g_pendingFirmwarePort.clear();
+                g_pendingFirmwareIsTemporary = false;
+                g_pendingFirmwareUsesArduinoCli = false;
+                g_pendingFirmwareOffset = 0;
+            }
+            if (!downloadedPath.empty() && !selectedPort.empty()) {
+                if (useArduinoCli) {
+                    launchArduinoCliFlash(
+                        window, selectedPort, downloadedPath, temporary);
+                } else {
+                    launchEsptoolFlash(
+                        window, selectedPort, downloadedPath, flashOffset, temporary);
+                }
+            } else {
+                g_firmwareStage = 0;
+                g_flashing = false;
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_TRAYICON:
+            if (lParam == WM_LBUTTONDBLCLK) {
+                ShowWindow(window, SW_SHOW);
+                ShowWindow(window, SW_RESTORE);
+                SetForegroundWindow(window);
+            } else if (lParam == WM_RBUTTONUP) {
+                POINT cursor = {};
+                GetCursorPos(&cursor);
+                HMENU menu = CreatePopupMenu();
+                AppendMenuW(menu, MF_STRING, 9001, L"Open Haptic Brake Control");
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, 9002, L"Exit");
+                SetForegroundWindow(window);
+                TrackPopupMenu(menu, TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, window, nullptr);
+                DestroyMenu(menu);
+            }
+            return 0;
+
+        case WM_CLOSE:
+            if (g_settings.minimizeToTray) {
+                addTrayIcon(window);
+                ShowWindow(window, SW_HIDE);
+            } else {
+                DestroyWindow(window);
+            }
+            return 0;
+
+        case WM_DESTROY:
+            g_appClosing = true;
+            KillTimer(window, 1);
+            stopConnection();
+            if (g_updateThread.joinable()) g_updateThread.join();
+            if (g_flashThread.joinable()) g_flashThread.join();
+            removeTrayIcon();
             DeleteObject(hFontRegular);
             DeleteObject(hFontBold);
-            DeleteObject(hFontTitle);
-            DeleteObject(hFontStatus);
-
+            DeleteObject(hFontSmall);
+            DeleteObject(hFontPageTitle);
+            DeleteObject(hFontHero);
+            DeleteObject(hFontValue);
+            unloadPrivateUiFonts();
+            if (g_appIconOwned && g_appIcon) DestroyIcon(g_appIcon);
+            if (g_singleInstanceMutex) CloseHandle(g_singleInstanceMutex);
             PostQuitMessage(0);
-            break;
-        }
-
-        default:
-            return DefWindowProc(hWnd, msg, wParam, lParam);
+            return 0;
     }
-    return 0;
+    return DefWindowProcW(window, message, wParam, lParam);
 }
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow) {
     if (lpCmdLine && strstr(lpCmdLine, "--self-test")) {
         NormalizedTelemetry testPacket;
         testPacket.sequence = 42;
@@ -1313,31 +1994,107 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         testPacket.suspensionFL = 0.045f;
         testPacket.suspensionFR = 0.046f;
         float roadTest = calculateRoadIntensity(0.051f, 0.050f, 0.10f, 1.0f / 60.0f);
-        return (validateTelemetry(testPacket) && fabs(roadTest - 0.60f) < 0.001f) ? 0 : 2;
+        const std::string jsonTest = R"({"tag_name":"v1.2.3"})";
+        const RECT desktopTest = {0, 0, 1920, 1080};
+        const SIZE dpi100 = scaledWindowSize(96, desktopTest);
+        const SIZE dpi150 = scaledWindowSize(144, desktopTest);
+        const FirmwareRelease mergedRelease = parseFirmwareReleaseJson(
+            R"({"tag_name":"V2.0","assets":[{"browser_download_url":"https://example/firmware.bin"},{"browser_download_url":"https://example/firmware.merged.bin"}]})");
+        const FirmwareRelease applicationRelease = parseFirmwareReleaseJson(
+            R"({"tag_name":"V2.0","assets":[{"browser_download_url":"https://example/firmware.bin"}]})");
+        const FirmwareRelease sourceRelease = parseFirmwareReleaseJson(
+            R"({"tag_name":"V2.0","assets":[{"browser_download_url":"https://example/haptic_firmware.ino"}]})");
+        const bool uiFontTest = privateUiFontSmokeTest();
+        isRunning = true;
+        isConnected = true;
+        g_connectionStopRequested = false;
+        signalSerialDisconnect();
+        const bool disconnectStateTest = !isRunning.load() && !isConnected.load()
+            && g_connectionStopRequested.load() && g_serialStatus.load() == 2;
+        return (validateTelemetry(testPacket) && fabs(roadTest - 0.60f) < 0.001f
+            && jsonStringValue(jsonTest, "tag_name") == "v1.2.3"
+            && dpi100.cx == 480 && dpi100.cy == 600
+            && dpi150.cx == 720 && dpi150.cy == 900
+            && mergedRelease.ok && mergedRelease.supportsBlankBoard
+            && mergedRelease.flashOffset == 0x0
+            && applicationRelease.ok && !applicationRelease.supportsBlankBoard
+            && applicationRelease.flashOffset == 0x10000
+            && sourceRelease.ok && !sourceRelease.sketchUrl.empty()
+            && uiFontTest
+            && !deviceHeartbeatExpired(10000, 5000)
+            && deviceHeartbeatExpired(10001, 5000)
+            && disconnectStateTest) ? 0 : 2;
     }
 
+    enablePerMonitorDpiAwareness();
     timeBeginPeriod(1);
     hInst = hInstance;
+    const bool requestedTray = lpCmdLine && strstr(lpCmdLine, "--tray");
+    g_singleInstanceMutex = CreateMutexW(
+        nullptr, TRUE, L"Local\\HapticBrakeControl.SingleInstance");
+    if (g_singleInstanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(L"HapticBrakeControlWindow", nullptr);
+        if (existing) {
+            ShowWindow(existing, SW_SHOW);
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+        }
+        MessageBoxW(nullptr,
+            L"Haptic Brake Control is already running.\n\n"
+            L"The existing window has been brought to the front. Check the system tray if you cannot see it.",
+            L"Haptic Brake Control", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        CloseHandle(g_singleInstanceMutex);
+        g_singleInstanceMutex = nullptr;
+        timeEndPeriod(1);
+        return 0;
+    }
+    g_appIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(1));
+    if (!g_appIcon) {
+        g_appIcon = createWaveLogoIcon();
+        g_appIconOwned = g_appIcon != nullptr;
+    }
+    loadPrivateUiFonts();
 
-    WNDCLASSA wc = { 0 };
-    wc.lpfnWndProc   = WndProc;
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc   = ModernWndProc;
     wc.hInstance     = hInstance;
-    wc.lpszClassName = "HapticPedalDarkGUI";
+    wc.lpszClassName = L"HapticBrakeControlWindow";
     wc.hbrBackground = NULL;
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
-    wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIcon         = g_appIcon ? g_appIcon : LoadIcon(nullptr, IDI_APPLICATION);
 
-    if (!RegisterClassA(&wc)) return 0;
+    if (!RegisterClassW(&wc)) {
+        unloadPrivateUiFonts();
+        if (g_appIconOwned && g_appIcon) DestroyIcon(g_appIcon);
+        if (g_singleInstanceMutex) CloseHandle(g_singleInstanceMutex);
+        timeEndPeriod(1);
+        return 0;
+    }
 
-    hWndMain = CreateWindowA(
-        "HapticPedalDarkGUI",
-        "get_telemetry",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 510, 700,
-        NULL, NULL, hInstance, NULL
-    );
+    RECT workArea = {};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    const SIZE initialSize = scaledWindowSize(dpiForWindowOrSystem(), workArea);
+    const int x = workArea.left + (workArea.right - workArea.left - initialSize.cx) / 2;
+    const int y = workArea.top + (workArea.bottom - workArea.top - initialSize.cy) / 2;
+    hWndMain = CreateWindowExW(
+        WS_EX_APPWINDOW,
+        L"HapticBrakeControlWindow",
+        L"Haptic Brake Control",
+        WS_POPUP | WS_MINIMIZEBOX,
+        x, y, initialSize.cx, initialSize.cy,
+        NULL, NULL, hInstance, NULL);
+    SendMessageW(hWndMain, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_appIcon));
+    SendMessageW(hWndMain, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_appIcon));
 
-    ShowWindow(hWndMain, nCmdShow);
+    if (!hWndMain) {
+        unloadPrivateUiFonts();
+        if (g_appIconOwned && g_appIcon) DestroyIcon(g_appIcon);
+        if (g_singleInstanceMutex) CloseHandle(g_singleInstanceMutex);
+        timeEndPeriod(1);
+        return 0;
+    }
+
+    ShowWindow(hWndMain, requestedTray ? SW_HIDE : nCmdShow);
     UpdateWindow(hWndMain);
 
     MSG msg;
@@ -1348,4 +2105,3 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     timeEndPeriod(1);
     return (int)msg.wParam;
 }
-

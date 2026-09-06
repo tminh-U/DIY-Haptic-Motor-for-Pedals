@@ -275,10 +275,11 @@ The Core 0 receiver includes a 500 ms watchdog that silences the output when val
 
 The host uses separate execution paths so simulator capture, USB transmission, serial monitoring, and GUI rendering do not block one another.
 
-1. **GUI thread** — Handles user actions and displays telemetry from atomic status variables.
-2. **Telemetry worker** — Detects AC or ACC, reads and validates simulator telemetry, calculates normalized output, and publishes the newest frame.
-3. **Serial sender** — Copies and sends the newest telemetry frame at a fixed 60 Hz rate, independently of simulator capture.
-4. **Serial monitor** — Reads ESP32 diagnostic output and reports fatal panics without blocking telemetry transmission.
+1. **GUI thread** - Handles user actions and displays telemetry from atomic status variables.
+2. **Telemetry worker** - Detects AC or ACC, reads and validates simulator telemetry, calculates normalized output, and publishes the newest frame.
+3. **Equalizer** - Customize effects and master volumes.
+3. **Serial sender** - Copies and sends the newest telemetry frame at a fixed 60 Hz rate, independently of simulator capture.
+4. **Serial monitor** - Reads ESP32 diagnostic output and reports fatal panics without blocking telemetry transmission.
 
 
 ## Academic and technical references

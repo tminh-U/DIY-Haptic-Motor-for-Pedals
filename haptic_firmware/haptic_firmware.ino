@@ -11,7 +11,7 @@
 const int LED_PIN = 2; 
 const int DAC_PIN = 25; 
 const char* HAPTIC_ID_PREFIX = "HAPTIC_PEDAL,1,";
-
+const char* HAPTIC_FIRMWARE_VERSION = "1.02";
 
 volatile float road_intensity = 0.0f, cur_slip = 0.0f, cur_absVal = 0.0f;
 volatile uint32_t telemetry_sequence = 0;
@@ -32,10 +32,12 @@ __attribute__((always_inline)) void publishTelemetry(float absVal, float roadInt
 
 
 char buffer[64];
+
 void printHapticIdentity() {
     uint64_t chipId = ESP.getEfuseMac();
-    Serial.printf("%s%04X%08X\n", HAPTIC_ID_PREFIX,
-        static_cast<uint16_t>(chipId >> 32), static_cast<uint32_t>(chipId));
+    Serial.printf("%s%04X%08X,%s\n", HAPTIC_ID_PREFIX,
+        static_cast<uint16_t>(chipId >> 32), static_cast<uint32_t>(chipId),
+        HAPTIC_FIRMWARE_VERSION);
 }
 
 
@@ -143,7 +145,6 @@ __attribute__((always_inline)) weightmp Mix(volatile float abs, volatile float s
 #define LUT_SIZE 1024
 
 DRAM_ATTR uint16_t t_abs = 0;
-#define MASTER_GAIN 0.80f
 #define step_abs   ((60.0f * LUT_SIZE) / SAMPLE_RATE)
 #define step_slipA ((50.0f * LUT_SIZE) / SAMPLE_RATE)
 #define step_slipB ((90.0f * LUT_SIZE) / SAMPLE_RATE)
@@ -246,7 +247,7 @@ void IRAM_ATTR calc_effect() {
     }
     float slip_effect = a_slip * LUT[int(phase_slip) & 1023] * curg_weight_slip;
 
-    float total = 128 + (abs_effect + road_effect + slip_effect) * MASTER_GAIN;
+    float total = 128 + (abs_effect + road_effect + slip_effect);
     total = (total > 0.0f ? total : 0);
     total = (total < 255.0f ? total : 255.0f);
     SET_PERI_REG_BITS(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_DAC, (uint8_t)total, RTC_IO_PDAC1_DAC_S);

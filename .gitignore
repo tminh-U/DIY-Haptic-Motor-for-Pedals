@@ -33,3 +33,22 @@
 
 # Arduino CLI build output (machine-specific and reproducible)
 **/build/
+
+# Inno Setup installer output
+**/Output/
+*.issig
+
+# Downloaded archives & temporary files
+*.zip
+*.tar.gz
+*.7z
+
+# Local settings and runtime logs
+haptic_brake_control.ini
+settings.ini
+*.log
+
+# Editor & IDE configs
+.vscode/
+.vs/
+*.user
