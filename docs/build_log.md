@@ -83,4 +83,26 @@ $$x_{\text{ABS}}(t) = (120 \cdot \text{brakeVal}) \cdot y(t)$$
 - Normalize both paths to the same boolean `absVal` field before serial transmission to the ESP32.
 
 
+10/9/2026
+
+**Today received items** :
+## Today works :
+
+### Fix fatal panic during floating-point effect calculations
+
+Preserve EXCSAVE1 and EPC1 around calc_effect() to prevent invalid memory access in the Level-1 interrupt handler using `mem_workaround` function:
+
+``` cpp
+void IRAM_ATTR mem_workaround() {
+    uint32_t Excsave1;
+    uint32_t Epc1;
+    asm volatile("rsr %0, excsave1\n rsr %1, epc1\n" : "=&a"(Excsave1), "=&a"(Epc1) : : "memory");
+    calc_effect();
+    asm volatile("wsr %0, excsave1\n wsr %1, epc1\n rsync\n" : : "a"(Excsave1), "a"(Epc1) : "memory");
+}
+```
+When using `float` in `calc_effect` function, it may overwrite the values of `excsave1` and `epc1` and later cause `ACCESS_VIOLATION`.
+`mem_workaround` saves the `excsave1` and `epc1` and then restores them later after `calc_effect()` function.
+Refs: <https://github.com/espressif/esp-idf/blob/v5.5.5/components/xtensa/xtensa_vectors.S>
+
 
