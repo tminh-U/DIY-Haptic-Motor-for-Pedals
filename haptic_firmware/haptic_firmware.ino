@@ -11,7 +11,7 @@
 const int LED_PIN = 2; 
 const int DAC_PIN = 25; 
 const char* HAPTIC_ID_PREFIX = "HAPTIC_PEDAL,1,";
-const char* HAPTIC_FIRMWARE_VERSION = "1.02";
+const char* HAPTIC_FIRMWARE_VERSION = "1.03";
 
 volatile float road_intensity = 0.0f, cur_slip = 0.0f, cur_absVal = 0.0f;
 volatile uint32_t telemetry_sequence = 0;
@@ -174,7 +174,7 @@ DRAM_ATTR float curg_weight_absVal = 0.0f, curg_weight_sus = 0.0f, curg_weight_s
 DRAM_ATTR float last_raw_absVal = 0.0f, last_raw_road_intensity = 0.0f, last_raw_slip = 0.0f;
 
 
-void IRAM_ATTR calc_effect() {
+void IRAM_ATTR __attribute__((noinline)) calc_effect() {
 
     // Bounded seqlock read: never spin indefinitely inside the 16 kHz ISR.
     // If the Core 0 writer is interrupted mid-update, reuse the last good frame.
@@ -289,6 +289,17 @@ void IRAM_ATTR calc_effect() {
     
 }
 
+
+void IRAM_ATTR mem_workaround() {
+    uint32_t Excsave1;
+    uint32_t Epc1;
+    asm volatile("rsr %0, excsave1\n rsr %1, epc1\n" : "=&a"(Excsave1), "=&a"(Epc1) : : "memory");
+    calc_effect();
+    asm volatile("wsr %0, excsave1\n wsr %1, epc1\n rsync\n" : : "a"(Excsave1), "a"(Epc1) : "memory");
+}
+
+
+
 hw_timer_t *timer = NULL;
 
 
@@ -305,7 +316,7 @@ void setup() {
 
     xTaskCreatePinnedToCore(serial_read, "Serial_Task", 8192, NULL, 1, NULL, 0);
     timer = timerBegin(2000000); 
-    timerAttachInterrupt(timer, &calc_effect);
+    timerAttachInterrupt(timer, &mem_workaround);
     timerAlarm(timer, 125, true, 0);
 
 }
