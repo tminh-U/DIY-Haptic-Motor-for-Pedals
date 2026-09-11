@@ -127,7 +127,7 @@ bool configureSerial(HANDLE serial) {
     timeouts.ReadIntervalTimeout = 10;
     timeouts.ReadTotalTimeoutConstant = 50;
     timeouts.ReadTotalTimeoutMultiplier = 0;
-    timeouts.WriteTotalTimeoutConstant = 5;
+    timeouts.WriteTotalTimeoutConstant = 8;
     if (!SetCommTimeouts(serial, &timeouts)) {
         return false;
     }
