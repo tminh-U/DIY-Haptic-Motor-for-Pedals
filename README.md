@@ -1,4 +1,4 @@
-# DIY Haptic Feedback for Sim Racing Pedals
+# DIY Haptic Feedback Motor for Sim Racing Pedals
 
 
 ## Overview 
