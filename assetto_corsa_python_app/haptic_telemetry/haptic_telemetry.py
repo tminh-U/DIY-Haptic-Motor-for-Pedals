@@ -1,4 +1,5 @@
 import mmap
+import math
 import struct
 
 import ac
@@ -45,8 +46,21 @@ def acUpdate(delta_t):
         brake = float(ac.getCarState(0, acsys.CS.Brake))
         speed_kmh = float(ac.getCarState(0, acsys.CS.SpeedKMH))
         slip_ratio = _wheel_values(ac.getCarState(0, acsys.CS.SlipRatio))
-        nd_slip = _wheel_values(ac.getCarState(0, acsys.CS.NdSlip))
+        # Diagnostic data must not interrupt brake feedback.
+        try:
+            nd_slip = _wheel_values(ac.getCarState(0, acsys.CS.NdSlip))
+            nd_slip = tuple(max(-100.0, min(100.0, value)) if math.isfinite(value) else 0.0
+                            for value in nd_slip)
+        except Exception:
+            nd_slip = (0.0, 0.0, 0.0, 0.0)
         suspension = _wheel_values(ac.getCarState(0, acsys.CS.SuspensionTravel))
+
+        # Pack before marking publication in progress; a pack error preserves
+        # the last coherent frame and still lets the host freshness timeout work.
+        payload = struct.pack(
+            "<8f", brake, speed_kmh, slip_ratio[0], slip_ratio[1],
+            nd_slip[0], nd_slip[1], suspension[0], suspension[1],
+        )
 
         odd_sequence = (_sequence + 1) & 0xffffffff
         if odd_sequence == 0:
@@ -58,17 +72,7 @@ def acUpdate(delta_t):
         # Seqlock publication: the C++ reader accepts a frame only when both
         # sequence values match and are even.
         _shared_memory[4:8] = struct.pack("<I", odd_sequence)
-        _shared_memory[8:40] = struct.pack(
-            "<8f",
-            brake,
-            speed_kmh,
-            slip_ratio[0],
-            slip_ratio[1],
-            nd_slip[0],
-            nd_slip[1],
-            suspension[0],
-            suspension[1],
-        )
+        _shared_memory[8:40] = payload
         _shared_memory[40:44] = struct.pack("<I", even_sequence)
         _shared_memory[4:8] = struct.pack("<I", even_sequence)
         _sequence = even_sequence

@@ -20,7 +20,7 @@ flowchart TD
         Bridge["Private memory-map reader\nhaptic_telemetry_v1 @ AC callback rate"]
         ACCReader["ACC direct reader @ 60 Hz\npacketId coherence check"]
         Gate["Slip gate + normalized road formula\nUse longitudinal SlipRatio only"]
-        Serial["Independent CSV serial output @ 60 Hz\n115200 baud"]
+        Serial["Independent CSV telemetry + gains @ 60 Hz\n115200 baud"]
         Bridge --> Gate --> Serial
         ACCReader --> Gate
     end
@@ -50,7 +50,7 @@ The in-game app `assetto_corsa_python_app/haptic_telemetry` publishes the follow
 | `brake` | `acsys.CS.Brake` | Gates all longitudinal brake-slip effects |
 | `speedKmh` | `acsys.CS.SpeedKMH` | Suppresses low-speed telemetry noise |
 | `slipRatio[FL, FR]` | `acsys.CS.SlipRatio` | ABS and lock-up detection |
-| `ndSlip[FL, FR]` | `acsys.CS.NdSlip` | Diagnostic only; never drives the brake pedal |
+| `ndSlip[FL, FR]` | `acsys.CS.NdSlip` | Diagnostic only; missing/invalid values become zero without interrupting feedback |
 | `suspensionTravel[FL, FR]` | `acsys.CS.SuspensionTravel` | Input to normalized suspension-velocity road effect |
 
 `get_telemetry.exe` opens `Local\acpmf_physics` only for the ABS enabled/configuration hint and `Local\acpmf_static` for `suspensionMaxTravel`. It does not read shared-memory `wheelSlip` for haptic output.
@@ -75,16 +75,30 @@ The reader checks `packetId` before and after copying a frame to reject torn sha
 Data is formatted as a CSV string and transmitted at **115200 baud, 8-N-1** over USB-UART.
 
 ```text
-absVal,slipRatioFL,slipRatioFR,roadIntensityFL,roadIntensityFR\n
+absVal,slipRatioFL,slipRatioFR,roadIntensityFL,roadIntensityFR,masterGain,absGain,roadGain,slipGain\n
 ```
+
+Firmware **1.04+** receives physical telemetry and four gains in `0..1`.
+Individual gains scale their generated waveforms; master gain scales the combined
+signal before adding the DAC midpoint. Volume settings do not change slip thresholds.
+
+The host selects this nine-field packet from the complete firmware identity.
+For older firmware it retains the legacy five-field packet with gains applied on
+the host. Firmware 1.04 also accepts legacy five-field packets with unity gains.
+Update both the app and firmware to get the corrected volume behavior.
+
+Both game readers accept finite extreme slip ratios; the worker saturates their
+absolute values at 2 before transmission. Diagnostic NdSlip is bounded to
+`-100..100`; nonfinite diagnostics become zero. Nonfinite essential telemetry
+still fails validation and cannot reach waveform synthesis.
 
 ### Packet validation
 
-1. Field count — Reject the packet unless the parser successfully extracts all five required telemetry values. 
+1. Field count — Accept exactly five legacy fields or nine fields with gains. Reject partial packets and trailing data. Bytes are accumulated until newline; fragmented USB delivery does not truncate a packet. Overlong lines are discarded through their newline.
 
 2. `isfinite()` check - Rejects `NaN`, `+Inf`, `-Inf` values that can result from UART byte corruption (e.g., partial packet, electrical noise). This prevents invalid floating-point values from propagating into the waveform synthesis math, where they would cause undefined behavior or crash.
 
-3. Range validation - Rejects packets unless `absVal` is in `0..1`, each longitudinal slip ratio is in `0..2.01`, and each normalized road intensity is in `0..1.001`.
+3. Range validation - Rejects packets unless `absVal` is in `0..1`, each longitudinal slip ratio is in `0..2.01`, each normalized road intensity is in `0..1.001`, and every supplied gain is finite and in `0..1`.
 
 ### Timing and fail-safe
 
@@ -102,6 +116,6 @@ The ESP32 has a stable eFuse MAC identifier. On every connection attempt, the PC
 PC   -> ID?\n
 ESP32 -> HAPTIC_PEDAL,1,<12-digit-eFuse-MAC>,<firmware-version>\n
 ```
-For example, `HAPTIC_PEDAL,1,00C4D2BD2A58, 1.01` is a valid wire response. This means COM port numbering may change after reconnecting USB without requiring the user to select a port manually. Also, this ID also allows the app to identify the firmware version currently installed on the board and determine whether an update is available.
+For example, `HAPTIC_PEDAL,1,00C4D2BD2A58,1.04` is a valid wire response. The host waits for a complete line and validates the 12 hexadecimal MAC digits before accepting the identity. This means COM port numbering may change after reconnecting USB without requiring the user to select a port manually. The identity also allows the app to determine whether an update is available.
 
 

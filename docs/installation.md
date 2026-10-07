@@ -10,6 +10,10 @@ See [Hardware guide](hardware.md).
 - Get `HapticBrakeControl_Setup.exe` from [Github Releases](https://github.com/tminh-U/DIY-Haptic-Motor-for-Pedals/releases).
 - Install the app
 
+For **1.04**, update the ESP32 firmware and replace the AC Python app folder below
+as well. The corrected volume behavior requires firmware 1.04; the host retains
+legacy output for older firmware.
+
 ## 2. Flash the ESP32 firmware
 
 - Open `Haptic Brake Control`.

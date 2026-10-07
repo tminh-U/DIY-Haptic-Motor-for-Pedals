@@ -26,7 +26,7 @@ flowchart TD
     A1 --> M["Sum active effect samples"]
     R1 --> M
     S1 --> M
-    M --> G["Apply master gain<br/>0.80"]
+    M --> G["Apply configured master gain<br/>0..1"]
     G --> O["Add DAC midpoint 128<br/>Clamp to 0–255"]
     O --> D["ESP32 DAC GPIO 25<br/>16 kHz sample rate"]
     D --> AMP["TPA3116D2 amplifier"]
@@ -39,7 +39,7 @@ flowchart TD
 2. **Per-effect pre-processing** - ABS is kept immediate, road intensity uses asymmetric EMA smoothing, and brake slip uses standard EMA smoothing.
 3. **Activity detection and headroom allocation** - three activity bits select one of eight mix-table rows. The selected ABS, road, and slip weights transition through a separate EMA to avoid sudden gain changes.
 4. **Waveform synthesis** - the firmware generates the gated 60 Hz ABS carrier, the 75 Hz road sine, and the alternating 50/90 Hz brake-slip sine independently.
-5. **Output conditioning** - active samples are added, multiplied by the `0.80` master gain, centered at DAC value `128`, and clamped to the 8-bit range.
+5. **Output conditioning** - individual volume gains scale generated effects; active samples are added, multiplied by the configured master gain, centered at DAC value `128`, and clamped to the 8-bit range. Firmware 1.04 receives these gains separately from physical telemetry.
 6. **Physical output** - GPIO 25 sends the 16 kHz DAC signal to the TPA3116D2 amplifier, which drives the pedal-mounted sound exciter.
 
 
@@ -120,7 +120,7 @@ $$\text{absVal} = (\text{brake} > 0.05 \ \land \ \text{speed} > 3\text{ km/h} \ 
 
 Once active, the host keeps `absVal = 1` until the brake/speed/availability gate fails or the maximum front slip falls below $0.70\kappa_{ABS}$. This hysteresis prevents rapid on/off toggling near the threshold.
 
-`absVal` is calculated by the host application and transmitted as the first field of the five-field serial packet. The ESP32 firmware does not detect ABS; it only uses this boolean value (`0` or `1`) to disable or enable the ABS waveform.
+`absVal` is calculated by the host application and transmitted as the first field of the telemetry packet. The ESP32 firmware does not detect ABS; it uses this boolean value (`0` or `1`) to disable or enable the ABS waveform. The nine-field protocol sends volume gains separately; the legacy five-field protocol sends already-scaled telemetry.
 
 **ESP32 waveform generation:**
 
@@ -193,9 +193,12 @@ When multiple effects happen at the same time (for example, braking under ABS wh
 
 $$x_{\text{mix}}(t) = g_{\text{ABS}}(t)x_{\text{ABS}}(t) + g_{\text{Road}}(t)x_{\text{Road}}(t) + g_{\text{Slip}}(t)x_{\text{Slip}}(t)$$
 
-where each $g(t)$ is the corresponding mix-table gain after weight-transition EMA smoothing. The master gain is then applied, and the DAC midpoint is added exactly once to the combined signal:
+where each $g(t)$ is the corresponding mix-table gain after weight-transition EMA smoothing multiplied by its effect volume. Disabled effects do not consume a mix-table allocation. Master gain is then applied, and the DAC midpoint is added exactly once to the combined signal:
 
-$$\text{DAC}(t) = \mathrm{clamp}_{[0,255]}\left(128 + 0.80 \cdot x_{\text{mix}}(t)\right)$$
+$$\text{DAC}(t) = \mathrm{clamp}_{[0,255]}\left(128 + G_{\text{master}} \cdot x_{\text{mix}}(t)\right)$$
+
+At 75% master, a saturated slip amplitude of 85 becomes 63.75 DAC counts.
+Physical slip is not multiplied by master before entering the nonlinear slip mapping.
 
 Each effect has a different native maximum amplitude, so the firmware uses one normalization factor per effect instead of a single shared headroom multiplier:
 

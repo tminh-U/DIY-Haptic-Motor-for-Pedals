@@ -11,10 +11,14 @@
 const int LED_PIN = 2; 
 const int DAC_PIN = 25; 
 const char* HAPTIC_ID_PREFIX = "HAPTIC_PEDAL,1,";
-const char* HAPTIC_FIRMWARE_VERSION = "1.03";
+const char* HAPTIC_FIRMWARE_VERSION = "1.04";
 
 volatile float road_intensity = 0.0f, cur_slip = 0.0f, cur_absVal = 0.0f;
 volatile uint32_t telemetry_sequence = 0;
+struct EffectGains {
+    float master, abs, road, slip;
+};
+DRAM_ATTR volatile EffectGains cur_gains = {1.0f, 1.0f, 1.0f, 1.0f};
 
 struct weightmp {
     float abs, sus, slip;
@@ -22,16 +26,21 @@ struct weightmp {
 
 // Single-writer seqlock: publish a coherent telemetry snapshot without taking
 // another portMUX from inside the GPTimer's shared interrupt handler.
-__attribute__((always_inline)) void publishTelemetry(float absVal, float roadIntensity, float slip) {
+__attribute__((always_inline)) void publishTelemetry(float absVal, float roadIntensity, float slip,
+        const EffectGains& gains = {1.0f, 1.0f, 1.0f, 1.0f}) {
     __atomic_add_fetch(&telemetry_sequence, 1, __ATOMIC_SEQ_CST); // odd: update in progress
     cur_absVal = absVal;
     road_intensity = roadIntensity;
     cur_slip = slip;
+    cur_gains.master = gains.master;
+    cur_gains.abs = gains.abs;
+    cur_gains.road = gains.road;
+    cur_gains.slip = gains.slip;
     __atomic_add_fetch(&telemetry_sequence, 1, __ATOMIC_SEQ_CST); // even: snapshot ready
 }
 
 
-char buffer[64];
+char buffer[128];
 
 void printHapticIdentity() {
     uint64_t chipId = ESP.getEfuseMac();
@@ -59,15 +68,28 @@ void serial_read(void *pvParameters) {
 
     unsigned long lastValidPacket = millis();
     bool watchdogActive = false;
+    size_t position = 0;
+    bool discardLine = false;
     for (;;) {
-        if (Serial.available() > 0) {
-            size_t len = Serial.readBytesUntil('\n', buffer, sizeof(buffer) - 1);
+        while (Serial.available() > 0) {
+            int value = Serial.read();
+            if (value < 0) break;
+            if (value == '\r') continue;
+            if (value != '\n') {
+                if (!discardLine) {
+                    if (position < sizeof(buffer) - 1) buffer[position++] = (char)value;
+                    else { discardLine = true; position = 0; }
+                }
+                continue;
+            }
+            if (discardLine) { discardLine = false; continue; }
+            buffer[position] = '\0';
+            position = 0;
 
-            if (len > 0) {
-                buffer[len] = '\0';
+            if (buffer[0] != '\0') {
 
                 // Host discovery handshake. This is intentionally separate
-                // from the five-float telemetry protocol, so other USB serial
+                // from the telemetry protocol, so other USB serial
                 // devices cannot be mistaken for this haptic controller.
                 if (strcmp(buffer, "ID?") == 0) {
                     printHapticIdentity();
@@ -75,9 +97,22 @@ void serial_read(void *pvParameters) {
                 }
 
                 float absVal, slipL, slipR, roadL, roadR;
-                int count = sscanf(buffer, "%f,%f,%f,%f,%f", &absVal, &slipL, &slipR, &roadL, &roadR);
-                if (count == 5 && check(absVal, slipL, slipR, roadL, roadR)) {
-                    publishTelemetry(absVal, max(roadL, roadR), max(slipL, slipR));
+                EffectGains gains = {1.0f, 1.0f, 1.0f, 1.0f};
+                int end = 0;
+                int count = sscanf(buffer, "%f,%f,%f,%f,%f,%f,%f,%f,%f %n",
+                    &absVal, &slipL, &slipR, &roadL, &roadR,
+                    &gains.master, &gains.abs, &gains.road, &gains.slip, &end);
+                if (count == 5) {
+                    count = sscanf(buffer, "%f,%f,%f,%f,%f %n",
+                        &absVal, &slipL, &slipR, &roadL, &roadR, &end);
+                }
+                if ((count == 5 || count == 9) && end > 0 && buffer[end] == '\0'
+                    && check(absVal, slipL, slipR, roadL, roadR)
+                    && isfinite(gains.master) && gains.master >= 0.0f && gains.master <= 1.0f
+                    && isfinite(gains.abs) && gains.abs >= 0.0f && gains.abs <= 1.0f
+                    && isfinite(gains.road) && gains.road >= 0.0f && gains.road <= 1.0f
+                    && isfinite(gains.slip) && gains.slip >= 0.0f && gains.slip <= 1.0f) {
+                    publishTelemetry(absVal, max(roadL, roadR), max(slipL, slipR), gains);
                     lastValidPacket = millis();
                     watchdogActive = false;
                     digitalWrite(LED_PIN, HIGH);
@@ -88,7 +123,7 @@ void serial_read(void *pvParameters) {
         // Watchdog: if no valid data for 500ms, silence the motor
         // MUST be outside Serial.available() so it fires even when USB is disconnected
         if (!watchdogActive && millis() - lastValidPacket > 500) {
-            publishTelemetry(0.0f, 0.0f, 0.0f);
+            publishTelemetry(0.0f, 0.0f, 0.0f, {0.0f, 0.0f, 0.0f, 0.0f});
             watchdogActive = true;
             digitalWrite(LED_PIN, LOW);
         }
@@ -172,6 +207,7 @@ __attribute__((always_inline)) uint32_t xorshift32() {
 
 DRAM_ATTR float curg_weight_absVal = 0.0f, curg_weight_sus = 0.0f, curg_weight_slip = 0.0f;
 DRAM_ATTR float last_raw_absVal = 0.0f, last_raw_road_intensity = 0.0f, last_raw_slip = 0.0f;
+DRAM_ATTR EffectGains last_raw_gains = {1.0f, 1.0f, 1.0f, 1.0f};
 
 
 void IRAM_ATTR __attribute__((noinline)) calc_effect() {
@@ -181,6 +217,7 @@ void IRAM_ATTR __attribute__((noinline)) calc_effect() {
     float local_absVal = last_raw_absVal;
     float local_road_intensity = last_raw_road_intensity;
     float local_slip = last_raw_slip;
+    EffectGains local_gains = last_raw_gains;
     for (int attempt = 0; attempt < 3; ++attempt) {
         uint32_t before = __atomic_load_n(&telemetry_sequence, __ATOMIC_SEQ_CST);
         if (before & 1U) continue;
@@ -188,6 +225,7 @@ void IRAM_ATTR __attribute__((noinline)) calc_effect() {
         float candidate_absVal = cur_absVal;
         float candidate_road_intensity = road_intensity;
         float candidate_slip = cur_slip;
+        EffectGains candidate_gains = {cur_gains.master, cur_gains.abs, cur_gains.road, cur_gains.slip};
         uint32_t after = __atomic_load_n(&telemetry_sequence, __ATOMIC_SEQ_CST);
 
         if (before == after) {
@@ -197,6 +235,7 @@ void IRAM_ATTR __attribute__((noinline)) calc_effect() {
             last_raw_absVal = candidate_absVal;
             last_raw_road_intensity = candidate_road_intensity;
             last_raw_slip = candidate_slip;
+            local_gains = last_raw_gains = candidate_gains;
             break;
         }
     }
@@ -207,7 +246,9 @@ void IRAM_ATTR __attribute__((noinline)) calc_effect() {
 
 
 
-    weightmp cur_weight = Mix(local_absVal, curg_road_intensity, curg_slip);
+    weightmp cur_weight = Mix(local_gains.abs > 0.0f ? local_absVal : 0.0f,
+        local_gains.road > 0.0f ? curg_road_intensity : 0.0f,
+        local_gains.slip > 0.0f ? curg_slip : 0.0f);
     if (!weight_flag) {
         curg_weight_absVal = cur_weight.abs;
         curg_weight_sus = cur_weight.sus;
@@ -222,14 +263,14 @@ void IRAM_ATTR __attribute__((noinline)) calc_effect() {
 
     //ABS : (freq : 50 -> 60hz, amplitude : Max 105, but interupt with 12hz freq)
     //The magnitude of ABS will change the amplitude. (120 * absVal)
-    float abs_effect = (t_abs <= 800 ? (120.0f * curg_absVal) * LUT[int(phase_abs) & 1023] : 0.0f) * curg_weight_absVal;
+    float abs_effect = (t_abs <= 800 ? (120.0f * curg_absVal) * LUT[int(phase_abs) & 1023] : 0.0f) * curg_weight_absVal * local_gains.abs;
 
     // Road effect: the PC has already calculated and clamped normalized
     // suspension velocity to 0..1 using each car's suspensionMaxTravel.
     float a_road = curg_road_intensity * 65.0f;
     a_road = (a_road < 65.0f ? a_road : 65.0f);
 
-    float road_effect = curg_weight_sus * a_road * LUT[int(phase_sus) & 1023];
+    float road_effect = curg_weight_sus * a_road * LUT[int(phase_sus) & 1023] * local_gains.road;
 
     // Longitudinal brake slip ratio: a light warning starts at 3%, then rises
     // more strongly through the tyre-limit region and toward full lock-up.
@@ -245,9 +286,9 @@ void IRAM_ATTR __attribute__((noinline)) calc_effect() {
     } else {
         a_slip = 85.0f;
     }
-    float slip_effect = a_slip * LUT[int(phase_slip) & 1023] * curg_weight_slip;
+    float slip_effect = a_slip * LUT[int(phase_slip) & 1023] * curg_weight_slip * local_gains.slip;
 
-    float total = 128 + (abs_effect + road_effect + slip_effect);
+    float total = 128 + local_gains.master * (abs_effect + road_effect + slip_effect);
     total = (total > 0.0f ? total : 0);
     total = (total < 255.0f ? total : 255.0f);
     SET_PERI_REG_BITS(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_DAC, (uint8_t)total, RTC_IO_PDAC1_DAC_S);

@@ -98,6 +98,7 @@ GameKind detectRunningGame() {
 }
 
 atomic<HANDLE> hSerial{INVALID_HANDLE_VALUE};
+char g_hapticDeviceId[32] = {0};
 atomic<bool> g_pauseSerialWrites{false};
 atomic<bool> g_connectionStopRequested{false};
 atomic<ULONGLONG> g_lastDeviceHeartbeat{0};
@@ -158,7 +159,10 @@ bool readHapticIdentity(HANDLE serial, char* deviceId, size_t deviceIdSize) {
             if (identity) {
                 identity += strlen(HAPTIC_HANDSHAKE_PREFIX);
                 size_t idLength = strcspn(identity, "\r\n");
-                if (idLength > 0 && idLength < deviceIdSize) {
+                if (identity[idLength] == '\0') continue; // Wait for the complete line.
+                if (idLength > 13 && idLength < deviceIdSize
+                    && strspn(identity, "0123456789ABCDEFabcdef") == 12
+                    && identity[12] == ',') {
                     memcpy(deviceId, identity, idLength);
                     deviceId[idLength] = '\0';
                     return true;
@@ -311,13 +315,24 @@ bool initPythonTelemetry() {
 void sendDataToESP32(float absVal, float slipRatioL, float slipRatioR, float roadL, float roadR) {
     if (g_pauseSerialWrites.load(memory_order_acquire)) return;
     const float master = g_masterGain.load(memory_order_relaxed);
-    absVal *= master * g_absGain.load(memory_order_relaxed);
-    slipRatioL *= master * g_slipGain.load(memory_order_relaxed);
-    slipRatioR *= master * g_slipGain.load(memory_order_relaxed);
-    roadL *= master * g_roadGain.load(memory_order_relaxed);
-    roadR *= master * g_roadGain.load(memory_order_relaxed);
-    char buffer[64];
-    int len = sprintf_s(buffer, "%.4f,%.4f,%.4f,%.4f,%.4f\n", absVal, slipRatioL, slipRatioR, roadL, roadR);
+    const float absGain = g_absGain.load(memory_order_relaxed);
+    const float roadGain = g_roadGain.load(memory_order_relaxed);
+    const float slipGain = g_slipGain.load(memory_order_relaxed);
+    const char* version = strchr(g_hapticDeviceId, ',');
+    int major = 0, minor = 0;
+    if (version) sscanf(version + 1, "%d.%d", &major, &minor);
+    char buffer[128];
+    int len;
+    if (major > 1 || (major == 1 && minor >= 4)) {
+        // Firmware 1.04 applies gains to waveforms, preserving physical thresholds.
+        len = sprintf_s(buffer, "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+            absVal, slipRatioL, slipRatioR, roadL, roadR, master, absGain, roadGain, slipGain);
+    } else {
+        // Keep the five-field protocol for older firmware.
+        len = sprintf_s(buffer, "%.4f,%.4f,%.4f,%.4f,%.4f\n",
+            absVal * master * absGain, slipRatioL * master * slipGain,
+            slipRatioR * master * slipGain, roadL * master * roadGain, roadR * master * roadGain);
+    }
     lock_guard<mutex> writeLock(g_serialWriteMutex);
     HANDLE serial = hSerial.load(memory_order_acquire);
     if (serial == INVALID_HANDLE_VALUE) return;
@@ -372,15 +387,12 @@ struct NormalizedTelemetry {
 bool validateTelemetry(const NormalizedTelemetry& parsed) {
     if (!isfinite(parsed.brake) || !isfinite(parsed.speedKmh)
         || !isfinite(parsed.slipRatioFL) || !isfinite(parsed.slipRatioFR)
-        || !isfinite(parsed.ndSlipFL) || !isfinite(parsed.ndSlipFR)
         || !isfinite(parsed.suspensionFL) || !isfinite(parsed.suspensionFR)) {
         return false;
     }
 
     if (parsed.brake < -0.01f || parsed.brake > 1.01f
         || parsed.speedKmh < -5.0f || parsed.speedKmh > 1000.0f
-        || fabs(parsed.slipRatioFL) > 10.0f || fabs(parsed.slipRatioFR) > 10.0f
-        || fabs(parsed.ndSlipFL) > 100.0f || fabs(parsed.ndSlipFR) > 100.0f
         || fabs(parsed.suspensionFL) > 2.0f || fabs(parsed.suspensionFR) > 2.0f) {
         return false;
     }
@@ -437,6 +449,9 @@ bool readPythonTelemetry(NormalizedTelemetry& out) {
     uint32_t sequenceAfter = shared->sequenceStart;
     if (sequenceBefore != sequenceEnd || sequenceBefore != sequenceAfter) return false;
     if (!validateTelemetry(parsed)) return false;
+    // Diagnostic values must not silence valid brake telemetry.
+    parsed.ndSlipFL = isfinite(parsed.ndSlipFL) ? clamp(parsed.ndSlipFL, -100.0f, 100.0f) : 0.0f;
+    parsed.ndSlipFR = isfinite(parsed.ndSlipFR) ? clamp(parsed.ndSlipFR, -100.0f, 100.0f) : 0.0f;
 
     out = parsed;
     return true;
@@ -595,7 +610,6 @@ char g_panicMessage[2048] = {0};
 // 0 = idle, 1 = connected, 2 = serial error, 3 = disconnected, 4 = no matching haptic device
 atomic<int> g_serialStatus{0};
 char g_serialPortName[32] = {0};
-char g_hapticDeviceId[32] = {0};
 
 // Live Telemetry Cache for GUI rendering
 struct LiveData {
@@ -773,7 +787,9 @@ void serialMonitorWorker() {
                         if (!isCapturing) {
                             if (strstr(lineBuf, "Guru Meditation") || strstr(lineBuf, "panic") ||
                                 strstr(lineBuf, "abort()") || strstr(lineBuf, "LoadProhibited") ||
-                                strstr(lineBuf, "StoreProhibited") || strstr(lineBuf, "InstrFetchProhibited")) {
+                                strstr(lineBuf, "StoreProhibited") || strstr(lineBuf, "InstrFetchProhibited") ||
+                                strstr(lineBuf, "Brownout detector") || strstr(lineBuf, "Interrupt wdt timeout") ||
+                                strstr(lineBuf, "Task watchdog got triggered")) {
                                 lock_guard<mutex> lock(g_panicMutex);
                                 strncpy(g_panicMessage, lineBuf, sizeof(g_panicMessage) - 1);
                                 g_panicMessage[sizeof(g_panicMessage) - 1] = '\0';
@@ -1863,7 +1879,7 @@ LRESULT CALLBACK ModernWndProc(HWND window, UINT message, WPARAM wParam, LPARAM 
                     lock_guard<mutex> lock(g_panicMutex);
                     panic = g_panicMessage;
                 }
-                std::wstring messageText = L"ESP32 kernel panic detected.\n\n"
+                std::wstring messageText = L"ESP32 fault detected.\n\n"
                     + utf8ToWide(panic) + L"\n\nReset the ESP32 before continuing.";
                 MessageBoxW(window, messageText.c_str(), L"ESP32 Fatal Panic", MB_ICONERROR);
             }

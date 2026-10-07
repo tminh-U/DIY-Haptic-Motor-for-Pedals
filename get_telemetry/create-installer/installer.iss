@@ -1,6 +1,6 @@
 ; Inno Setup packaging script for Haptic Brake Control (DIY Haptic Motor for Pedals)
 #define MyAppName "Haptic Brake Control"
-#define MyAppVersion "1.0.3"
+#define MyAppVersion "1.0.4"
 #define MyAppPublisher "tminh"
 #define MyAppURL "https://github.com/tminh-U/DIY-Haptic-Motor-for-Pedals"
 #define MyAppExeName "get_telemetry.exe"
