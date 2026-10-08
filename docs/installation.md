@@ -14,6 +14,13 @@ For **1.04**, update the ESP32 firmware and replace the AC Python app folder bel
 as well. The corrected volume behavior requires firmware 1.04; the host retains
 legacy output for older firmware.
 
+The app checks GitHub Releases once in the background when it starts. In
+**Settings > App updates**, view the installed/latest version or select
+**Check for updates** to retry. An amber dot on Settings indicates an available
+app update. **Download update** opens the official installer in your browser;
+run it to install the update. Firmware updates remain in the Firmware tab.
+Update checks use the [GitHub Releases API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release).
+
 ## 2. Flash the ESP32 firmware
 
 - Open `Haptic Brake Control`.

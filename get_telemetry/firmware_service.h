@@ -3,20 +3,47 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <string>
 #include <vector>
+#include "app_version.h"
 
 struct FirmwareRelease {
     bool ok = false;
     std::string version;
     std::string binaryUrl;
     std::string sketchUrl;
+    std::string installerUrl;
     DWORD flashOffset = 0;
     bool supportsBlankBoard = false;
     std::string error;
 };
+
+inline bool parseAppVersion(const std::string& text, std::array<unsigned, 3>& version) {
+    version = {};
+    size_t position = !text.empty() && (text[0] == 'v' || text[0] == 'V') ? 1 : 0;
+    unsigned count = 0;
+    while (position < text.size() && count < version.size()) {
+        if (text[position] < '0' || text[position] > '9') return false;
+        unsigned value = 0;
+        while (position < text.size() && text[position] >= '0' && text[position] <= '9') {
+            value = value * 10 + static_cast<unsigned>(text[position++] - '0');
+            if (value > 999999) return false;
+        }
+        version[count++] = value;
+        if (position == text.size()) break;
+        if (text[position++] != '.' || position == text.size()) return false;
+    }
+    if (position != text.size() || count < 2) return false;
+    // Historical tags V1.04/V1.10 mean installer versions 1.0.4/1.0.10.
+    if (count == 2) {
+        version[2] = version[1];
+        version[1] = 0;
+    }
+    return true;
+}
 
 inline std::string jsonStringValue(const std::string& json, const std::string& key,
                                    size_t startAt = 0) {
@@ -58,6 +85,13 @@ inline FirmwareRelease parseFirmwareReleaseJson(const std::string& response) {
         std::string lowered = url;
         std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const std::string installerName = "/HapticBrakeControl_Setup.exe";
+        if (url.rfind("https://github.com/tminh-U/DIY-Haptic-Motor-for-Pedals/releases/download/", 0) == 0
+            && url.size() > installerName.size()
+            && url.compare(url.size() - installerName.size(), installerName.size(), installerName) == 0
+            && url.find_first_of("\r\n\t \"<>\\?#") == std::string::npos) {
+            release.installerUrl = url;
+        }
         if (lowered.size() >= 4 && lowered.substr(lowered.size() - 4) == ".ino") {
             if (release.sketchUrl.empty()) release.sketchUrl = url;
         } else if (lowered.size() >= 4 && lowered.substr(lowered.size() - 4) == ".bin") {
@@ -65,11 +99,10 @@ inline FirmwareRelease parseFirmwareReleaseJson(const std::string& response) {
             const bool fullImage = lowered.find("merged") != std::string::npos
                 || lowered.find("factory") != std::string::npos
                 || lowered.find("full") != std::string::npos;
-            if (fullImage) {
+            if (fullImage && !release.supportsBlankBoard) {
                 release.binaryUrl = url;
                 release.flashOffset = 0x0;
                 release.supportsBlankBoard = true;
-                break;
             }
         }
         ++assetPosition;
@@ -123,11 +156,17 @@ inline FirmwareRelease fetchLatestFirmwareRelease() {
     std::string response;
     while (sent) {
         DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
+        if (!WinHttpQueryDataAvailable(request, &available)
+            || available > 1024 * 1024 - response.size()) {
+            sent = false;
+            break;
+        }
+        if (available == 0) break;
         const size_t oldSize = response.size();
         response.resize(oldSize + available);
         DWORD received = 0;
-        if (!WinHttpReadData(request, response.data() + oldSize, available, &received)) {
+        if (!WinHttpReadData(request, response.data() + oldSize, available, &received)
+            || received == 0) {
             sent = false;
             break;
         }

@@ -580,6 +580,11 @@ atomic<bool> g_appClosing{false};
 atomic<bool> g_powerSuspended{false};
 atomic<ULONGLONG> g_reconnectNotBefore{0};
 thread g_updateThread;
+thread g_appUpdateThread;
+atomic<bool> g_appUpdateChecking{false};
+std::wstring g_latestApp = L"Not checked";
+std::wstring g_appUpdateStatus = L"Ready";
+std::string g_appUpdateUrl;
 thread g_flashThread;
 std::wstring g_pendingFirmwarePath;
 std::wstring g_pendingFirmwarePort;
@@ -1222,6 +1227,8 @@ modern_ui::DrawModel currentDrawModel() {
     model.connected = isConnected.load();
     model.panicked = g_esp32Panicked.load();
     model.checkingUpdate = g_updateChecking.load();
+    model.checkingAppUpdate = g_appUpdateChecking.load();
+    model.currentApp = utf8ToWide(HAPTIC_APP_VERSION);
     model.flashing = g_flashing.load();
     const int detectedGame = g_detectedGameForUi.load();
     const int telemetryGame = g_live.gameKind.load();
@@ -1260,12 +1267,50 @@ modern_ui::DrawModel currentDrawModel() {
         lock_guard<mutex> lock(g_firmwareMutex);
         model.latestFirmware = g_latestFirmware;
         model.firmwareStatus = g_firmwareStatus;
+        model.latestApp = g_latestApp;
+        model.appUpdateStatus = g_appUpdateStatus;
+        model.appUpdateAvailable = !g_appUpdateUrl.empty();
         model.binaryAvailable = !g_latestFirmwareUrl.empty()
             || !g_latestFirmwareSketchUrl.empty();
         model.manualBinaryAvailable = (!g_latestFirmwareUrl.empty()
             && g_latestSupportsBlankBoard) || !g_latestFirmwareSketchUrl.empty();
     }
     return model;
+}
+
+void beginAppUpdateCheck(HWND window) {
+    if (g_appClosing.load() || g_appUpdateChecking.exchange(true)) return;
+    if (g_appUpdateThread.joinable()) g_appUpdateThread.join();
+    {
+        lock_guard<mutex> lock(g_firmwareMutex);
+        g_appUpdateUrl.clear();
+        g_appUpdateStatus = L"Contacting GitHub Releases...";
+    }
+    InvalidateRect(window, nullptr, FALSE);
+    g_appUpdateThread = thread([window] {
+        const FirmwareRelease release = fetchLatestFirmwareRelease();
+        std::array<unsigned, 3> latest{}, installed{};
+        {
+            lock_guard<mutex> lock(g_firmwareMutex);
+            g_latestApp = release.ok ? utf8ToWide(release.version) : L"Unavailable";
+            if (!release.ok) {
+                g_appUpdateStatus = L"Check failed. Check your connection and try again. "
+                    + utf8ToWide(release.error);
+            } else if (!parseAppVersion(release.version, latest)
+                       || !parseAppVersion(HAPTIC_APP_VERSION, installed)) {
+                g_appUpdateStatus = L"Unsupported release version. Check GitHub for details.";
+            } else if (latest <= installed) {
+                g_appUpdateStatus = L"Your app is up to date.";
+            } else if (release.installerUrl.empty()) {
+                g_appUpdateStatus = L"A newer release exists, but its app installer is unavailable.";
+            } else {
+                g_appUpdateUrl = release.installerUrl;
+                g_appUpdateStatus = L"Update available. Download and run the installer.";
+            }
+        }
+        g_appUpdateChecking = false;
+        if (!g_appClosing.load()) PostMessage(window, WM_APP + 21, 0, 0);
+    });
 }
 
 void beginUpdateCheck(HWND window) {
@@ -1661,6 +1706,7 @@ LRESULT CALLBACK ModernWndProc(HWND window, UINT message, WPARAM wParam, LPARAM 
             addTrayIcon(window);
             SetTimer(window, 1, 33, nullptr);
             startConnection();
+            beginAppUpdateCheck(window);
             return 0;
         }
 
@@ -1769,6 +1815,20 @@ LRESULT CALLBACK ModernWndProc(HWND window, UINT message, WPARAM wParam, LPARAM 
                     ShellExecuteW(window, L"open",
                         L"https://github.com/tminh-U/DIY-Haptic-Motor-for-Pedals",
                         nullptr, nullptr, SW_SHOWNORMAL);
+                } else if (modern_ui::contains(modern_ui::rect(55, 775, 335, 815), x, y)) {
+                    beginAppUpdateCheck(window);
+                } else if (modern_ui::contains(modern_ui::rect(355, 775, 665, 815), x, y)
+                           && !g_appUpdateChecking.load()) {
+                    std::string url;
+                    {
+                        lock_guard<mutex> lock(g_firmwareMutex);
+                        url = g_appUpdateUrl;
+                    }
+                    if (!url.empty() && reinterpret_cast<INT_PTR>(ShellExecuteW(window, L"open",
+                        utf8ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32) {
+                        lock_guard<mutex> lock(g_firmwareMutex);
+                        g_appUpdateStatus = L"Could not open the browser. Download from GitHub.";
+                    }
                 }
                 InvalidateRect(window, nullptr, FALSE);
             }
@@ -1980,6 +2040,7 @@ LRESULT CALLBACK ModernWndProc(HWND window, UINT message, WPARAM wParam, LPARAM 
             KillTimer(window, 1);
             stopConnection();
             if (g_updateThread.joinable()) g_updateThread.join();
+            if (g_appUpdateThread.joinable()) g_appUpdateThread.join();
             if (g_flashThread.joinable()) g_flashThread.join();
             removeTrayIcon();
             DeleteObject(hFontRegular);

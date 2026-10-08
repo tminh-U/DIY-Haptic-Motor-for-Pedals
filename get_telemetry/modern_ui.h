@@ -35,6 +35,8 @@ struct DrawModel {
     bool connected = false;
     bool panicked = false;
     bool checkingUpdate = false;
+    bool checkingAppUpdate = false;
+    bool appUpdateAvailable = false;
     bool flashing = false;
     bool portSelected = false;
     bool binaryAvailable = false;
@@ -47,6 +49,9 @@ struct DrawModel {
     std::wstring currentFirmware = L"Not detected";
     std::wstring latestFirmware = L"Not checked";
     std::wstring firmwareStatus = L"Ready";
+    std::wstring currentApp;
+    std::wstring latestApp = L"Not checked";
+    std::wstring appUpdateStatus = L"Ready";
     std::wstring selectedPort = L"No COM ports found";
     std::wstring gameName = L"No game detected";
     std::wstring gameStatus = L"Start Assetto Corsa or ACC";
@@ -149,6 +154,7 @@ inline void drawHeader(HDC dc, const DrawModel& model, const Fonts& fonts) {
         }
         if (index != 3) line(dc, tab.right, 88, tab.right, 116, RGB(27, 50, 69));
     }
+    if (model.appUpdateAvailable) circle(dc, 682, 102, 5, Amber);
     line(dc, 0, 132, 720, 132, Border);
 }
 
@@ -368,6 +374,19 @@ inline void drawSettingsPage(HDC dc, const DrawModel& model, const Fonts& fonts)
          rect(55, 548, 440, 608), fonts.small, Muted,
          DT_LEFT | DT_VCENTER | DT_WORDBREAK);
     drawButton(dc, rect(485, 535, 665, 585), L"Open GitHub", fonts, true, false);
+
+    rounded(dc, rect(28, 640, 692, 833), Surface, Border, 14);
+    text(dc, L"App updates", rect(55, 650, 665, 685), fonts.semibold, Text);
+    text(dc, L"Installed: " + model.currentApp + L"   |   Latest: " + model.latestApp,
+         rect(55, 687, 665, 717), fonts.small, Muted);
+    text(dc, model.appUpdateStatus, rect(55, 720, 665, 766), fonts.small,
+         model.appUpdateAvailable ? Cyan : Muted,
+         DT_LEFT | DT_VCENTER | DT_WORDBREAK);
+    drawButton(dc, rect(55, 775, 335, 815),
+               model.checkingAppUpdate ? L"Checking..." : L"Check for updates", fonts,
+               !model.checkingAppUpdate, false);
+    drawButton(dc, rect(355, 775, 665, 815), L"Download update", fonts,
+               model.appUpdateAvailable && !model.checkingAppUpdate);
 }
 
 inline void draw(HDC dc, const DrawModel& model, const Fonts& fonts) {
